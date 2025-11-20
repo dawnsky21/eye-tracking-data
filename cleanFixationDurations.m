@@ -21,10 +21,10 @@ function subj = cleanFixationDurations(subj, shortThresh, longThresh)
 %       subj.trial(t).longFixIdx        (긴 fixation 인덱스)
 
     if nargin < 2 || isempty(shortThresh)
-        shortThresh = 80;   % 예: 60–80ms
+        shortThresh = 60;   % 예: 60–80ms
     end
     if nargin < 3 || isempty(longThresh)
-        longThresh = 800;   % 예: 800–1200ms
+        longThresh = 1200;   % 예: 800–1200ms
     end
 
     % (D) 작은 안전장치: fixation 이벤트가 없으면 바로 종료

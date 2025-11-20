@@ -166,8 +166,8 @@ paddingPx = 2;
 subj = mapFixationsToWordROIs(subj, results.wordRects, paddingPx);
 
 % 6. Fixation duration 기반 클리닝
-shortThresh = 80;
-longThresh  = 800;
+shortThresh = 60;
+longThresh  = 1200;
 subj = cleanFixationDurations(subj, shortThresh, longThresh);
 
 % 7. word × trial 지표 계산 (FFD, GD, TVT, skip, regressions 등)
@@ -278,8 +278,8 @@ badTrial = badTrial | trialSummary.skipRate > qcCfg.maxSkipRate;
 badTrial = badTrial | trialSummary.readingTimeMs < qcCfg.minReadingTimeMs;
 badTrial = badTrial | trialSummary.readingTimeMs > qcCfg.maxReadingTimeMs;
 
-% (3) (옵션) 오답 trial 제외하고 싶으면 아래 줄 주석 해제
-% badTrial = badTrial | ~trialSummary.acc;
+% (3) 오답 trial 제외
+badTrial = badTrial | ~trialSummary.acc;
 
 trialSummary.badTrial = badTrial;
 
