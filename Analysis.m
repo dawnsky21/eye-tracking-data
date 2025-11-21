@@ -27,13 +27,103 @@ if ~isfile(ascFile)
     error('ASC 파일을 찾을 수 없습니다: %s', ascFile);
 end
 
-% --- mainscript 결과(ROI 정보) 불러오기 ---
+% --- mainscript 결과(ROI + design 정보) 불러오기 ---
 elFile = fullfile(baseDir, subjDir, 'EL_demo.mat');
-if ~isfile(elFile)
-    error('EL_demo.mat not found: %s', elFile);
+S = load(elFile);   % 안에 있는 변수 전부 읽기
+
+if ~isfield(S, 'results') || ~isfield(S, 'dp')
+    error('EL_demo.mat 안에 results 또는 dp 변수가 없습니다.');
+end
+results = S.results;
+dp      = S.dp;
+
+% --- Main 시트 읽기 (designRow 매핑 + target용) ---
+xlsxPath = fullfile(baseDir, 'Experimental stimulus_실험용_수정본6.xlsx');
+if ~isfile(xlsxPath)
+    error('엑셀 파일을 찾을 수 없습니다: %s', xlsxPath);
+end
+Tmain = readtable(xlsxPath, 'Sheet','Main', 'TextType','string');
+
+% --- designRow 확보: (1) Final.designRow 있으면 그대로, 없으면 문장 매칭으로 복구 ---
+if isfield(S, 'Final') && isfield(S.Final, 'designRow')
+    Final     = S.Final;
+    designRow = double(Final.designRow);
+else
+    warning('Final/designRow 없음 → Pilot3 호환 모드: 문장 내용으로 designRow를 복구합니다.');
+
+    nTrials = numel(results.words);
+    designRow = zeros(nTrials,1);
+
+    % 1) 엑셀 문장 → 단어 리스트 전처리
+    nRows = height(Tmain);
+    sentWords = cell(nRows,1);
+    for r = 1:nRows
+        s = string(Tmain.sentence(r));
+        if exist('cleanSentence','file')
+            s = cleanSentence(s);
+        end
+        ws = split(strtrim(s));
+        sentWords{r} = string(ws(:));
+    end
+
+    % 2) 각 trial의 results.words{t}와 매칭되는 row 찾기
+    for t = 1:nTrials
+        wTrial = string(results.words{t}(:));
+        if isempty(wTrial)
+            continue;
+        end
+
+        matchIdx = [];
+        for r = 1:nRows
+            wRow = sentWords{r};
+            if numel(wRow) ~= numel(wTrial)
+                continue;
+            end
+            if all(wRow == wTrial)
+                matchIdx(end+1) = r; %#ok<AGROW>
+            end
+        end
+
+        if numel(matchIdx) == 1
+            designRow(t) = matchIdx;
+        elseif isempty(matchIdx)
+            warning('Trial %d: 엑셀 Main에서 매칭 문장을 찾지 못했습니다.', t);
+        else
+            warning('Trial %d: 엑셀 Main에서 매칭 row가 여러 개(%d개)입니다. 첫 번째만 사용.', ...
+                    t, numel(matchIdx));
+            designRow(t) = matchIdx(1);
+        end
+    end
 end
 
-load(elFile, 'results', 'dp');
+% --- designRow 범위 체크 + targetIdxPerTrial 만들기 ---
+bad = (designRow < 1) | (designRow > height(Tmain));
+if any(bad)
+    warning('일부 designRow가 Main 시트 범위를 벗어났습니다(비매칭 trial일 수 있음).');
+end
+
+% 1) 엑셀에서 target index 벡터 가져오기
+%    네가 보여준 엑셀 헤더가
+%    sentence, freq, valence, is_catch, target_word, target_idx
+%    였으니까, 우선 target_idx를 찾도록 짜자.
+varNameCandidates = {'target_idx','targetIndex','target_idx_','targetPos'};  % 열 이름이 다를 경우 대비
+nameIdx = find(ismember(Tmain.Properties.VariableNames, varNameCandidates), 1);
+
+if isempty(nameIdx)
+    error('Main 시트에서 target index 변수(target_idx 등)를 찾지 못했습니다.');
+end
+
+targetVarName = Tmain.Properties.VariableNames{nameIdx};
+tmp = double(Tmain.(targetVarName));   % 엑셀에서 target index 벡터
+
+% 2) NaN은 catch trial로 보고 0으로
+tmp(isnan(tmp)) = 0;   % catch trial → 0
+
+% 3) trial별 targetIdxPerTrial 채우기
+targetIdxPerTrial = zeros(size(designRow));
+valid = designRow >= 1 & designRow <= height(Tmain);
+targetIdxPerTrial(valid) = tmp(designRow(valid));
+
 % results.wordRects{t} : 각 trial의 [nWords×4] (L T R B) ROI
 % results.words{t}     : 각 trial의 단어 string 리스트(있다면)
 
@@ -172,6 +262,33 @@ subj = cleanFixationDurations(subj, shortThresh, longThresh);
 
 % 7. word × trial 지표 계산 (FFD, GD, TVT, skip, regressions 등)
 wordTbl = makeWordTrialTable(subj, results);
+
+%% === Target(N) / Spillover(N+1) 플래그 추가 ===
+wordTbl.isTarget    = false(height(wordTbl),1);
+wordTbl.isSpillover = false(height(wordTbl),1);
+
+% mainIdx는 위에서 이미 계산됨: TRIALID 기반 main trial 인덱스
+nDesign     = numel(targetIdxPerTrial);   % Final(=Main) 기준 trial 개수
+nMainTrials = numel(mainIdx);             % ASC에서 실제 잡힌 main trial 개수
+nLoop       = min(nDesign, nMainTrials);
+
+fprintf('[CHECK] nDesign=%d, nMainTrials=%d, nLoop=%d\n', ...
+        nDesign, nMainTrials, nLoop);
+
+for k = 1:nLoop
+    trIdx = mainIdx(k);              % subj.trial / wordTbl.trial 기준 main trial 인덱스
+    tIdx  = targetIdxPerTrial(k);    % 이 main trial에서의 표적 단어 위치(엑셀 target_idx)
+
+    if tIdx <= 0
+        continue;  % catch trial 등: target 없음
+    end
+
+    rows = (wordTbl.trial == trIdx);
+    pos  = wordTbl.wordIdx(rows);
+
+    wordTbl.isTarget(rows)    = (pos == tIdx);
+    wordTbl.isSpillover(rows) = (pos == (tIdx+1));
+end
 
 % 결과 확인 예시
 head(wordTbl)          % 앞 몇 줄 눈으로 확인
