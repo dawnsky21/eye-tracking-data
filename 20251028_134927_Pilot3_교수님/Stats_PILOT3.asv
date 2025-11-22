@@ -1,0 +1,236 @@
+%% Stats_PILOT3: Pilot3 word-level 분석
+
+% === 1. 폴더 경로 설정 ===
+baseDir = 'C:\Users\김민서\Desktop\Data1';
+subjDir = '20251028_134927_Pilot3_교수님';
+
+% === 2. 파일 로드 ===
+% QC summary
+load(fullfile(baseDir, subjDir, 'eyeReading_cleanSummary.mat'));   % cleanSummary, trialSummary, qcCfg
+
+% word-level table
+load(fullfile(baseDir, subjDir, 'wordTbl_PILOT3.mat'));            % wordTbl
+
+% fixation-level / trial 정보 (Analysis.m에서 subj를 subj.mat로 저장했다고 가정)
+load(fullfile(baseDir, subjDir, 'subj.mat'), 'subj');   % subj만 필요
+
+% (중요) 아래 코드는 Analysis.m을 먼저 실행해서
+% results, Tmain, designRow가 이미 workspace에 있다고 가정함.
+%   - results.wordRects
+%   - Tmain.freq / Tmain.valence / Tmain.is_catch
+%   - designRow(trial) = Main 시트 row 인덱스
+
+% === 3. usable trial만 남기기 ===
+goodTrials = cleanSummary.trial;                
+useRows    = ismember(wordTbl.trial, goodTrials);
+w          = wordTbl(useRows, :);     
+
+
+%% 1-A. SFD(single fixation duration) 만들기
+% 정의: 그 단어 위 고정이 딱 1번(nFix==1) 있었을 때, 그 FFD가 SFD가 됨
+% 나머지는 NaN
+
+w.SFD = nan(height(w),1);   % 새 변수 추가
+
+% 고정이 정확히 1번이고, FFD가 NaN이 아닌 경우만 SFD로 인정
+idxOneFix = (w.nFix == 1) & ~isnan(w.FFD);
+w.SFD(idxOneFix) = w.FFD(idxOneFix);
+
+
+%% 1-B. Landing position (모든 단어 기준으로 계산 → N에서 subset 사용)
+
+% fixation struct
+fx = subj.event.fix;
+
+% 각 fixation의 word index와 x좌표를 벡터로 뽑기
+fxWord = [fx.word]';      % word index (0: 어떤 단어에도 매핑 안 된 fixation)
+if isfield(fx, 'xCorr')
+    fxX = [fx.xCorr]';    % drift-corrected 좌표
+else
+    fxX = [fx.x]';        % 혹시 xCorr가 없으면 raw x
+end
+
+% 결과 컬럼 초기화
+w.landingRaw  = nan(height(w),1);   % 픽셀 기준: (firstFixX - wordLeft)
+w.landingNorm = nan(height(w),1);   % 정규화: (firstFixX - wordLeft) / wordWidth
+
+for i = 1:height(w)
+    tr = w.trial(i);     % trial 번호 (subj.trial 인덱스로 사용)
+    wi = w.wordIdx(i);   % 해당 trial 내 단어 위치 (1,2,3,...)
+
+    if isnan(wi) || wi <= 0
+        continue;
+    end
+    if tr < 1 || tr > numel(subj.trial)
+        continue;
+    end
+
+    % 이 trial에 속한 fixation들의 global index
+    fixIdx = subj.trial(tr).fixIdx(:);
+    fixIdx = fixIdx(fixIdx > 0 & fixIdx <= numel(fxWord));  % 안전 범위 체크
+    if isempty(fixIdx)
+        continue;
+    end
+
+    % 이 trial에서 wordIdx == wi 인 fixation만 선택
+    fixOnWord = fixIdx(fxWord(fixIdx) == wi);
+    if isempty(fixOnWord)
+        % 이 단어 위에 fixation이 한 번도 없으면 landing = NaN
+        continue;
+    end
+
+    % 이 단어에 대한 첫 fixation
+    f1     = fixOnWord(1);
+    xFirst = fxX(f1);
+
+    % 해당 trial의 word ROI 가져오기
+    if tr > numel(results.wordRects) || isempty(results.wordRects{tr})
+        continue;
+    end
+    rects = results.wordRects{tr};   % [nWords×4] (L T R B)
+    if wi > size(rects,1)
+        continue;
+    end
+
+    rect  = rects(wi,:);
+    xL    = rect(1);
+    xR    = rect(3);
+    width = xR - xL;
+
+    % raw landing (픽셀 단위)
+    w.landingRaw(i) = xFirst - xL;
+
+    % normalized landing (0~1 사이가 이상적, 단어 폭으로 나눔)
+    if width > 0
+        w.landingNorm(i) = (xFirst - xL) / width;
+    end
+end
+
+
+%% 2. N / N+1 분리 (isTarget / isSpillover)
+
+wN  = w(w.isTarget,    :);     % 표적 어절(N)
+wN1 = w(w.isSpillover, :);     % spillover 어절(N+1)
+
+%% === N+1 regression path duration outlier trimming (trial은 유지) ===
+
+thrReg = 8000;   % 네가 정한 기준값
+
+% outlier 표시
+isBadReg = wN1.regPathDur > thrReg;
+
+fprintf('regPathDur > %d ms: %d rows will be set to NaN.\n', thrReg, sum(isBadReg));
+
+% 값만 제거 (trial은 유지)
+wN1.regPathDur(isBadReg) = NaN;
+
+% trimming 후 분포 재확인
+rp = wN1.regPathDur(~isnan(wN1.regPathDur));
+fprintf('After trimming: mean=%.1f, sd=%.1f, median=%.1f, max=%.1f\n', ...
+    mean(rp), std(rp), median(rp), max(rp));
+
+%% 5-A. N 단어 go-past time / N+1 regression path duration 만들기
+
+% 전제: Analysis.m에서 wordTbl.goPast가 이미 계산되어 있음
+if ~ismember("goPast", w.Properties.VariableNames)
+    error('wordTbl.goPast가 없습니다. Analysis.m에서 goPast 계산 코드를 먼저 실행하세요.');
+end
+
+% 1) N 단어 go-past time
+wN.goPast = w.goPast(w.isTarget);   % N 단어에서의 go-past time(ms)
+
+% 2) N+1 regression path duration
+%    → 개념적으로 N+1 단어 기준 go-past time과 동일하게 사용
+wN1.regPathDur = w.goPast(w.isSpillover);   % N+1 위치에서의 regression path duration(ms)
+
+%% 3. 실험 조건(freq, valence, is_catch) 붙이기
+
+% 전체 w에 대한 row index (Main 시트 상 row 번호)
+itemRow_all = designRow(w.trial);
+
+w.freq    = Tmain.freq(itemRow_all);
+w.valence = Tmain.valence(itemRow_all);
+w.isCatch = Tmain.is_catch(itemRow_all);
+
+% N / N+1에도 각각 붙이기
+itemRow_N  = designRow(wN.trial);
+itemRow_N1 = designRow(wN1.trial);
+
+wN.freq    = Tmain.freq(itemRow_N);
+wN.valence = Tmain.valence(itemRow_N);
+wN.isCatch = Tmain.is_catch(itemRow_N);
+
+wN1.freq    = Tmain.freq(itemRow_N1);
+wN1.valence = Tmain.valence(itemRow_N1);
+wN1.isCatch = Tmain.is_catch(itemRow_N1);
+
+
+%% 4. N+1 Regressions Out (regOut_N1) 계산
+% 정의(간단 버전):
+%   - N+1 단어 위 fixation들 중 하나에서
+%   - 바로 다음 fixation이 "왼쪽 단어(wordIdx < 현재 wordIdx)"로 향하면 1, 아니면 0
+
+wN1.regOut = nan(height(wN1),1);   % NaN: N+1 위 fixation 자체가 없을 때
+
+for i = 1:height(wN1)
+    tr = wN1.trial(i);
+    wi = wN1.wordIdx(i);   % N+1 단어 index
+
+    if isnan(wi) || wi <= 0
+        continue;
+    end
+    if tr < 1 || tr > numel(subj.trial)
+        continue;
+    end
+
+    % 이 trial의 fixation 시퀀스
+    fixIdx = subj.trial(tr).fixIdx(:);
+    fixIdx = fixIdx(fixIdx > 0 & fixIdx <= numel(fxWord));  % 안전 범위 체크
+    if isempty(fixIdx)
+        continue;
+    end
+
+    % 이 trial에서 N+1 단어 위에 위치한 fixation들
+    fixOnWord = fixIdx(fxWord(fixIdx) == wi);
+    if isempty(fixOnWord)
+        % 이 N+1 단어가 완전히 skip된 경우 → NaN
+        wN1.regOut(i) = NaN;
+        continue;
+    end
+
+    regFlag = 0;
+
+    % N+1 위의 fixation들 중 하나라도,
+    % "그 다음 fixation의 wordIdx < N+1의 wordIdx"이면 regression-out으로 본다.
+    for k = 1:numel(fixOnWord)
+        fGlobal = fixOnWord(k);                 % global fixation index
+        posInTrial = find(fixIdx == fGlobal, 1, 'first');
+        if isempty(posInTrial) || posInTrial >= numel(fixIdx)
+            continue;  % trial 마지막 fixation이면 다음 fixation 없음
+        end
+
+        nextFix = fixIdx(posInTrial + 1);
+        wNext   = fxWord(nextFix);
+
+        if wNext > 0 && wNext < wi
+            regFlag = 1;
+            break;
+        end
+    end
+
+    wN1.regOut(i) = regFlag;
+end
+
+
+%% 5. 간단 확인 출력
+
+fprintf('Clean trials: %d\n', numel(goodTrials));
+fprintf('N words: %d, N+1 words: %d\n', height(wN), height(wN1));
+
+% 예: N에서 landing 분포 / SFD 유무 확인
+% head(wN(:, {'trial','wordIdx','wordStr','FFD','SFD','landingRaw','landingNorm'}))
+% tabulate(~isnan(wN.SFD))
+% tabulate(~isnan(wN.landingNorm))
+
+% 예: N+1에서 regress-out 비율 확인
+% tabulate(wN1.regOut)
