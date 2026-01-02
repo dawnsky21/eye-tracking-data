@@ -40,6 +40,11 @@ function subj = parseAscToStruct(ascFile)
     recStartTimes = [];   % START 이벤트 시간들
     recEndTimes   = [];   % END   이벤트 시간들
 
+    % ---- NEW: 설정/메타 ----
+    sampleCfgLine = string("");
+    sampleCoordType = "UNKNOWN";   % "GAZE" / "HREF" / "UNKNOWN"
+    displayRect     = [NaN NaN NaN NaN]; % [L T R B], DISPLAY_COORDS에서 얻음
+
     % ---- 파싱 진단용 카운터 ----
     nEFIX    = 0; nEFIX_ok    = 0;
     nEBLINK  = 0; nEBLINK_ok  = 0;
@@ -50,13 +55,36 @@ function subj = parseAscToStruct(ascFile)
     %% 1) 줄 단위 파싱
     for i = 1:nLines
         tline = strtrim(lines{i});
-        if isempty(tline)
+        if isempty(tline), continue; end
+
+        % ===== NEW (2): DISPLAY_COORDS 파싱 (스킵 전에 먼저) =====
+        if startsWith(tline, 'DISPLAY_COORDS')
+            tok = regexp(tline, '^DISPLAY_COORDS\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', 'tokens', 'once');
+            if ~isempty(tok)
+                displayRect = cellfun(@str2double, tok);  % [L T R B]
+            end
+            continue;
+        end
+
+
+        % ===== NEW (1): SAMPLES 라인 저장 + coordType 판정 (스킵 전에 먼저) =====
+        if startsWith(tline, 'SAMPLES')
+            sampleCfgLine = string(tline);
+
+            % "GAZE"/"HREF" 키워드 기반으로 결정 (설정이 곧 정의)
+            if contains(sampleCfgLine, "GAZE", "IgnoreCase", true)
+                sampleCoordType = "GAZE";
+            elseif contains(sampleCfgLine, "HREF", "IgnoreCase", true)
+                sampleCoordType = "HREF";
+            else
+                sampleCoordType = "UNKNOWN";
+            end
             continue;
         end
 
         % 1) 헤더/설정 라인 → 스킵 (START/END는 빼기)
         if startsWith(tline, '**') || startsWith(tline, 'PUPIL') || ...
-           startsWith(tline, 'EVENTS') || startsWith(tline, 'SAMPLES') || ...
+           startsWith(tline, 'EVENTS') || ...
            startsWith(tline, 'INPUT')  || ...
            startsWith(tline, 'PRESCALER') || startsWith(tline, 'VPRESCALER')
             continue;
@@ -167,45 +195,42 @@ function subj = parseAscToStruct(ascFile)
             continue;
         end
 
-                % 6) 숫자로 시작하는 줄 → sample 후보
-        if ~isempty(regexp(tline(1), '\d', 'once'))
+        % 6) 숫자로 시작하는 줄 → sample 후보
+        if ~isempty(regexp(tline, '^\d', 'once'))
+            nSamp = nSamp + 1;
 
-            % 지금 ASC 포맷: time gx gy pupil 네 개
-            C = textscan(tline, '%f %f %f %f');
+    [ok, t, gx, gy, pup] = parseSample4(tline);
 
-            if ~any(cellfun(@isempty, C))
-                % → 진짜 샘플 포맷(4개 숫자)일 때만 샘플로 인정
-                nSamp    = nSamp + 1;      % 실제 샘플 라인 수
-                nSamp_ok = nSamp_ok + 1;   % 파싱 성공
-
-                sampleTime(end+1,1) = C{1};
-                sampleGx(end+1,1)   = C{2};
-                sampleGy(end+1,1)   = C{3};
-                samplePup(end+1,1)  = C{4};
-            else
-                % 샘플 포맷이 아닌 숫자줄 (예: "6.17e-06, -1.54e-05")
-                badSampleLines{end+1,1} = tline;
-            end
-
-            continue;
-        end
+    if ok 
+       nSamp_ok = nSamp_ok + 1; 
+       sampleTime(end+1,1) = t; 
+       sampleGx(end+1,1) = gx; % '.'였으면 NaN 
+       sampleGy(end+1,1) = gy; % '.'였으면 NaN 
+       samplePup(end+1,1) = pup; % '.'였으면 NaN 
+    else 
+       badSampleLines{end+1,1} = tline; 
+    end 
+    continue; 
+    end
 
         % 그 외 라인은 일단 무시
     end   % for i = 1:nLines
 
-    % ---- 파싱 요약/경고 ----
+     % ---- 파싱 요약 ----
     fprintf('EFIX parsed:   %d / %d lines\n', nEFIX_ok,   nEFIX);
     fprintf('EBLINK parsed: %d / %d lines\n', nEBLINK_ok, nEBLINK);
     fprintf('SAMPLE parsed: %d / %d lines\n', nSamp_ok,   nSamp);
 
-    if nEFIX_ok < nEFIX
-        warning('Some EFIX lines could not be parsed. Check ASC format.');
+    if any(isnan(displayRect))
+        warning('DISPLAY_COORDS not found in ASC. subj.displayRect remains NaN.');
     end
-    if nEBLINK_ok < nEBLINK
-        warning('Some EBLINK lines could not be parsed. Check ASC format.');
-    end
-    if nSamp_ok < nSamp
-        warning('Some SAMPLE lines could not be parsed. Check ASC format or sample format (time gx gy pupil).');
+
+    % ---- NEW: 설정 요약 ----
+    fprintf('[ASC CFG] coordType=%s | displayRect=[%g %g %g %g]\n', ...
+        char(sampleCoordType), displayRect(1),displayRect(2),displayRect(3),displayRect(4));
+
+    if strlength(sampleCfgLine) > 0
+        fprintf('[ASC CFG] %s\n', char(sampleCfgLine));
     end
 
     if ~isempty(badSampleLines)
@@ -223,6 +248,12 @@ function subj = parseAscToStruct(ascFile)
     subj.sample.gy     = sampleGy;
     subj.sample.pupil  = samplePup;
 
+    % ===== NEW =====
+    subj.sample.cfgLine   = sampleCfgLine;
+    subj.sample.coordType = sampleCoordType;
+    subj.displayRect      = displayRect;
+    % ===============
+
     subj.event.msg   = msgList;
     subj.event.fix   = fixList;
     subj.event.sacc  = saccList;
@@ -237,6 +268,44 @@ function subj = parseAscToStruct(ascFile)
     end
     subj.event.rec = recList;
 
+    function [ok, t, gx, gy, pup] = parseSample4(tline)
+    % time gx gy pupil 4개만 안전 파싱
+    % '.' 또는 비수치 토큰 -> NaN 허용
+
+    tok = regexp(strtrim(tline), '\s+', 'split');
+    if numel(tok) < 4
+        ok = false; t=NaN; gx=NaN; gy=NaN; pup=NaN; return;
+    end
+
+    tok4 = tok(1:4);
+
+    % (A) time 토큰은 정수(ms)만 허용
+    % "12345" OK, "1.2", "1e-5", "0.0001," 전부 탈락
+    if isempty(regexp(tok4{1}, '^\d+$', 'once'))
+        ok = false; t=NaN; gx=NaN; gy=NaN; pup=NaN; return;
+    end
+
+    % (B) gx/gy/pupil만 콤마 제거 (time은 건드리지 않음)
+    for j = 2:4
+        tok4{j} = regexprep(tok4{j}, ',', '');
+    end
+
+    v = nan(1,4);
+    for j = 1:4
+        if strcmp(tok4{j}, '.') || strcmpi(tok4{j}, 'NA') || strcmpi(tok4{j}, 'NaN')
+            v(j) = NaN;
+        else
+            v(j) = str2double(tok4{j}); % 숫자면 숫자, 아니면 NaN
+        end
+    end
+
+    % time은 숫자여야 “샘플”로 인정
+    ok = ~isnan(v(1));
+    t   = v(1);
+    gx  = v(2);
+    gy  = v(3);
+    pup = v(4);
+    end
 end
 
 %% 분석 결과

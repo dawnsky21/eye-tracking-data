@@ -61,14 +61,30 @@ function subj = cleanFixationDurations(subj, shortThresh, longThresh)
         end
 
         % 이 trial에 속한 fixation들
-        fixIdx = idx(:)';                 % row vector
-        fix    = subj.event.fix(fixIdx);  % struct array
-        dur    = [fix.dur];
+        fixIdx = idx(:)';
+        fixIdx = fixIdx(fixIdx>=1 & fixIdx<=numel(subj.event.fix));
+
+        if isempty(fixIdx)
+            subj.trial(t).fixIdxDurClean = [];
+            subj.trial(t).longFixIdx     = [];
+            continue;
+        end
+
+        fix = subj.event.fix(fixIdx);
+
+        dur = arrayfun(@(ff) double(ff.dur), fix);
 
         if hasWord
-            words = [fix.word];           % 같은 단어 여부 확인용
+            words = zeros(size(dur));
+            for ii = 1:numel(fix)
+                if isfield(fix(ii),'word') && ~isempty(fix(ii).word)
+                    words(ii) = double(fix(ii).word);
+                else
+                    words(ii) = 0;   % word 없으면 ROI 밖으로 취급
+                end
+            end
         else
-            words = nan(size(dur));       % word 정보 없으면 merge 안 함
+            words = zeros(size(dur));     % word 정보 없으면 전부 0 처리
         end
 
         keep = true(size(fixIdx));        % 기본은 keep

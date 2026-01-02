@@ -85,27 +85,38 @@ function subj = addTrialsFromMsg(subj)
             inThisWindow = mTime > tStart;
         end
 
-        isTrialEnd = inThisWindow & cellfun(@(s) isMsg(s, 'TRIAL_END'), mText);
-        endIdx = find(isTrialEnd);
+        endTokens = ["TRIAL_END","TRIAL_RESULT","PRACTICE_TRIAL_RESULT"];
+
+        endIdx = [];
+        for kk = 1:numel(endTokens)
+            endIdx = [endIdx; find(inThisWindow & cellfun(@(s) isMsg(s, char(endTokens(kk))), mText))]; %#ok<AGROW>
+        end
+        endIdx = sort(endIdx);
 
         if ~isempty(endIdx)
-            tEnd = mTime(endIdx(end));  % 이 trial의 마지막 TRIAL_END 시간
+            tEnd = mTime(endIdx(end));  % 가장 마지막 endToken을 end로
         else
-            % TRIAL_END가 없으면 fallback: 다음 trial 시작 직전 or 샘플 끝
+            % 그래도 없으면 기존 fallback 유지(다음 trial 시작-1 / 샘플끝)
             if t < nTrials
                 tEnd = nextStartTime - 1;
             else
                 tEnd = sampTime(end);
             end
-            % 경고: TRIAL_END 누락
-            warning('addTrialsFromMsg: trial %d (%s) has no TRIAL_END. Using fallback tEnd=%d.', ...
+            warning('addTrialsFromMsg: trial %d (%s) has no end token (TRIAL_END/TRIAL_RESULT). Using fallback tEnd=%d.', ...
                     t, trialIdText, tEnd);
         end
 
         % 2) SENTENCE_ONSET, QUESTION_ONSET, RESPONSE 찾기
         inTrialMsg = mTime >= tStart & mTime <= tEnd;
 
-        sentMask = inTrialMsg & cellfun(@(s) isMsg(s, 'SENTENCE_ONSET'), mText);
+        sentTokens = ["SENTENCE_ONSET_RIGHTABC","SENTENCE_ONSET", ...
+              "PRACTICE_SENTENCE_ONSET_RIGHTABC","PRACTICE_SENTENCE_ONSET"];
+
+        sentMask = false(size(mTime));
+        for kk = 1:numel(sentTokens)
+            sentMask = sentMask | (inTrialMsg & cellfun(@(s) isMsg(s, char(sentTokens(kk))), mText));
+        end
+
         qMask    = inTrialMsg & cellfun(@(s) isMsg(s, 'QUESTION_ONSET'), mText);
         respMask = inTrialMsg & cellfun(@(s) isMsg(s, 'RESPONSE'),       mText);
 
@@ -117,7 +128,7 @@ function subj = addTrialsFromMsg(subj)
             sentenceOnset = sentTimes(1);
         else
             sentenceOnset = NaN;
-            warning('addTrialsFromMsg: trial %d (%s) has no SENTENCE_ONSET within [%d, %d].', ...
+            warning('addTrialsFromMsg: trial %d (%s) has no sentence-onset token within [%d, %d].', ...
                     t, trialIdText, tStart, tEnd);
         end
 

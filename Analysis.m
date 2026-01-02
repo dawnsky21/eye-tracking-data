@@ -18,8 +18,8 @@
 
 % 폴더 및 ASC 파일 경로 설정
 baseDir = pwd;
-subjDir = '20251028_134927_Pilot3_교수님';
-ascFileName = 'PILOT3.asc';
+subjDir = '20251202_121351_sub01';
+ascFileName = '01.asc';
 ascFile = fullfile(baseDir, subjDir, ascFileName);
 
 disp(ascFile)   % 실제 경로 확인용
@@ -38,7 +38,7 @@ results = S.results;
 dp      = S.dp;
 
 % --- Main 시트 읽기 (designRow 매핑 + target용) ---
-xlsxPath = fullfile(baseDir, 'Experimental stimulus_실험용_수정본6.xlsx');
+xlsxPath = fullfile(baseDir, 'Experimental stimulus_실험용_수정본7.xlsx');
 if ~isfile(xlsxPath)
     error('엑셀 파일을 찾을 수 없습니다: %s', xlsxPath);
 end
@@ -59,10 +59,12 @@ else
     sentWords = cell(nRows,1);
     for r = 1:nRows
         s = string(Tmain.sentence(r));
+        s = normalizeSpaces(s);                 
         if exist('cleanSentence','file')
             s = cleanSentence(s);
         end
-        ws = split(strtrim(s));
+        s = normalizeSpaces(s);                 
+        ws = split(s);                          % strtrim 불필요
         sentWords{r} = string(ws(:));
     end
 
@@ -93,6 +95,73 @@ else
                     t, numel(matchIdx));
             designRow(t) = matchIdx(1);
         end
+    end
+end
+
+% === (A) 확인할 trial 지정 ===
+trialsToInspect = [105 215];
+
+% === (B) 엑셀 key 미리 만들어두기 (Tmain.sentence 기준) ===
+excelKey = strings(height(Tmain),1);
+for r = 1:height(Tmain)
+    excelKey(r) = makeSentenceKey(normalizeSpaces(Tmain.sentence(r)));  
+end
+
+% === (C) trial별로 원문/키 출력 + (있으면) 가장 가까운 후보 몇 개 보여주기 ===
+for t = trialsToInspect
+    fprintf('\n============================\n');
+    fprintf('[INSPECT] Trial %d\n', t);
+
+    % 1) trial 원문(단어열) 출력
+    if t <= numel(results.words) && ~isempty(results.words{t})
+        wTrial = string(results.words{t}(:));
+        disp("wTrial (words) = ");
+        disp(wTrial');
+        trialSentence = strjoin(wTrial, " ");
+    else
+        disp("wTrial is empty or trial index out of range.");
+        trialSentence = "";
+    end
+
+    trialSentence = normalizeSpaces(trialSentence);  
+
+    % 2) trial key 출력
+    tKey = makeSentenceKey(trialSentence);
+    fprintf('trialSentence = %s\n', trialSentence);
+    fprintf('trialKey      = %s\n', tKey);
+
+    % 3) 엑셀에서 exact key 매칭되는 row 있는지
+    hit = find(excelKey == tKey, 1);
+    if ~isempty(hit)
+        fprintf('[MATCH] Excel row = %d\n', hit);
+        fprintf('excelSentence(raw) = %s\n', string(Tmain.sentence(hit)));
+        continue;
+    end
+
+    fprintf('[NO EXACT MATCH] Showing a few candidates by similarity...\n');
+
+    % 4) 간단 유사도: 공통 문자 비율(대충)로 상위 5개 후보
+    %    (정교한 edit distance가 필요하면 추가해줄게)
+    scores = zeros(height(Tmain),1);
+    for r = 1:height(Tmain)
+        s = excelKey(r);
+        if strlength(s)==0 || strlength(tKey)==0
+            scores(r) = 0;
+        else
+            % 공통 토큰 기반(공백 분할 key) 점수
+            a = split(tKey, " ");
+            b = split(s, " ");
+            scores(r) = numel(intersect(a,b)) / max(numel(a),1);
+        end
+    end
+
+    [~, idx] = sort(scores, 'descend');
+    topK = idx(1:min(5,numel(idx)));
+
+    fprintf('Top candidates (row | score | sentence):\n');
+    for k = 1:numel(topK)
+        r = topK(k);
+        fprintf('  %4d | %.3f | %s\n', r, scores(r), string(Tmain.sentence(r)));
     end
 end
 
@@ -130,13 +199,37 @@ targetIdxPerTrial(valid) = tmp(designRow(valid));
 % 2. ASC → MATLAB struct (sample + event)
 %   → parseAscToStruct 내부에서 sample, fix/sacc/blink, MSG, START/END까지 다 파싱해서
 %     subj.sample / subj.event.*에 정리함.
+
 subj = parseAscToStruct(ascFile);
+
+% === MSG 토큰 빈도 + TRIAL 관련 MSG 샘플(진단) ===
+msgText = string({subj.event.msg.text});
+
+tok = regexprep(msgText, "\s+.*$", "");  % 첫 토큰만
+[ut,~,ic] = unique(tok);
+cnt = accumarray(ic,1);
+[~,ord] = sort(cnt,'descend');
+
+k = min(30, numel(ord));
+if k == 0
+    disp(table(string.empty(0,1), double.empty(0,1), ...
+        'VariableNames', {'msgToken','count'}));
+else
+    tokTop = ut(ord(1:k));  tokTop = tokTop(:);   % ★ column 강제
+    cntTop = cnt(ord(1:k)); cntTop = cntTop(:);   % ★ column 강제
+    disp(table(tokTop, cntTop, 'VariableNames', {'msgToken','count'}));
+end
+
+ix = contains(msgText,"TRIAL","IgnoreCase",true);
+disp(msgText(find(ix, 30, 'first')));
+
 
 % 2.1 샘플 validity 플래그
 subj = addSampleValidity(subj, [0 0 1920 1080], 50);
 
 % 2.2 MSG 기반 trial 경계 정의 및 trial struct 만들기
 subj = addTrialsFromMsg(subj);
+subj = addReadWindowFromMsg(subj);
 
 %% 3. drift 기준점(xTrue, yTrue) 자동 계산 (main trial 첫 단어 평균)
 
@@ -253,7 +346,44 @@ subj = cleanFixations(subj, [0 0 1920 1080], lineYRange, 50, 70);
 
 % 5. fixation → word ROI 매핑
 paddingPx = 2;
-subj = mapFixationsToWordROIs(subj, results.wordRects, paddingPx);
+% subj = mapFixationsToWordROIs(subj, results.wordRects, paddingPx);
+
+% === 옵션 1: Main trial만 ROI 매핑 ===
+isMain  = arrayfun(@(tr) startsWith(string(tr.id), "TRIALID"), subj.trial);
+mainIdx = find(isMain);
+
+for k = 1:numel(mainIdx)
+    t = mainIdx(k);               % subj.trial index
+
+    if k > numel(results.wordRects), break; end
+    rects = results.wordRects{k};
+    if isempty(rects), continue; end
+
+    fixIdx = subj.trial(t).fixIdx(:);
+    fixIdx = fixIdx(fixIdx>0 & fixIdx<=numel(subj.event.fix));
+    if isempty(fixIdx), continue; end
+
+    if isfield(subj.event.fix, "xCorr")
+        x = [subj.event.fix(fixIdx).xCorr]';
+        y = [subj.event.fix(fixIdx).yCorr]';
+    else
+        x = [subj.event.fix(fixIdx).x]';
+        y = [subj.event.fix(fixIdx).y]';
+    end
+
+    L = rects(:,1) - paddingPx;  T = rects(:,2) - paddingPx;
+    R = rects(:,3) + paddingPx;  B = rects(:,4) + paddingPx;
+
+    w = zeros(numel(fixIdx),1);
+    for wi = 1:size(rects,1)
+        hit = (x>=L(wi) & x<=R(wi) & y>=T(wi) & y<=B(wi));
+        w(hit & w==0) = wi;
+    end
+
+    for ii = 1:numel(fixIdx)
+        subj.event.fix(fixIdx(ii)).word = w(ii);
+    end
+end
 
 % 6. Fixation duration 기반 클리닝
 shortThresh = 60;

@@ -1,7 +1,7 @@
 function subj = applyDriftCorrection(subj, driftCfg)
 % applyDriftCorrection  trial 단위 drift correction 및 bad drift trial 플래그
 %
-%   subj = applyDriftCorrection(subj, driftCfg)
+%  subj = applyDriftCorrection(subj, driftCfg)
 %
 %   필수/옵션 필드 (driftCfg):
 %       .xTrue        : 기준 단어/marker의 이상적인 x 좌표 (스칼라 또는 [nTrial×1])
