@@ -5,8 +5,6 @@
 %
 % NOTE: ABC(LEFT/RIGHT) + gate 관련 코드는 완전 제거
 
-trialNumWanted = 66;
-
 % ===== SENTENCE_ONSET ~ PROMPT_ONSET(미포함)만 보기 =====
 onlySentenceBeforePrompt = true;   % true: SENTENCE_ONSET <= fix.onset < PROMPT_ONSET
 
@@ -26,13 +24,22 @@ assert(exist("subj","var")==1 && isfield(subj,"trial") && isfield(subj,"event") 
     "subj / subj.trial / subj.event.fix 필요");
 assert(exist("results","var")==1, "results 필요");
 
-%% 1) TRIALID -> subj trial index (tSubj)
-trialIDstr = sprintf("TRIALID %d", trialNumWanted);
-tSubj = find(strcmp({subj.trial.id}, trialIDstr), 1);
-assert(~isempty(tSubj), "%s not found in subj.trial", trialIDstr);
+%% 1) main trial 순번(1~224)으로 선택 → tSubj/tw 결정
+mainOrderWanted = 204;  % 1~224
 
-% ★ 핵심: results 인덱스는 tSubj 기준으로 접근
-tw = tSubj;
+ids = string({subj.trial.id})';
+isMain = startsWith(ids,"TRIALID","IgnoreCase",true);
+mainIdx = find(isMain);
+
+assert(mainOrderWanted>=1 && mainOrderWanted<=numel(mainIdx), "mainOrderWanted out of range");
+
+tSubj = mainIdx(mainOrderWanted);  % subj trial index
+tw    = mainOrderWanted;           % results index(=main-only)
+
+fprintf("[MAIN] order=%d | %s | tSubj=%d | tw=%d\n", ...
+    mainOrderWanted, ids(tSubj), tSubj, tw);
+
+trialIDstr = ids(tSubj);   % 예: "TRIALID 179"
 
 %% 1-1) ROI(rects) / words(wlist): results{tw}
 assert(isfield(results,'wordRects') && tw>=1 && tw<=numel(results.wordRects) && ~isempty(results.wordRects{tw}), ...
