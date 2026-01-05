@@ -1,12 +1,12 @@
 %% TRIALID Scanpath + ROI + 단어라벨 + fixation(scatter) + start/end
 %    + COORD모드표기 + word1 inROI QC
-%    + SENTENCE_ONSET ~ PROMPT_ONSET(미포함) fixation만 보기
+%    + 읽기 구간(read window) 기반: readFixIdx / readStart / readEnd 사용
 %    + prePROMPT sample: gx/gy가 정규화(0~1)면 픽셀로 변환해서 표시(아니면 px로 간주)
 %
 % NOTE: ABC(LEFT/RIGHT) + gate 관련 코드는 완전 제거
 
-% ===== SENTENCE_ONSET ~ PROMPT_ONSET(미포함)만 보기 =====
-onlySentenceBeforePrompt = true;   % true: SENTENCE_ONSET <= fix.onset < PROMPT_ONSET
+% ===== read window만 보기 =====
+useReadWindow = true;   % true: readFixIdx 기반 (SENTENCE_ONSET~PROMPT_ONSET)
 
 % 색
 scanBlue    = [0 0.4470 0.7410];
@@ -60,33 +60,60 @@ else
 end
 
 %% 2) fixations (subj.trial(tSubj)에서 추출)
+t = tSubj;
+
+% --- (A) base fixation source: dur-clean 우선 (원래 로직 유지) ---
 useDurClean = false;
-if isfield(subj.trial(tSubj),'fixIdxDurClean') && ~isempty(subj.trial(tSubj).fixIdxDurClean)
-    fixIdx = subj.trial(tSubj).fixIdxDurClean(:);
+if isfield(subj.trial(t),'fixIdxDurClean') && ~isempty(subj.trial(t).fixIdxDurClean)
+    baseFixIdx = subj.trial(t).fixIdxDurClean(:);
     useDurClean = true;
-elseif isfield(subj.trial(tSubj),'fixIdx') && ~isempty(subj.trial(tSubj).fixIdx)
-    fixIdx = subj.trial(tSubj).fixIdx(:);
+elseif isfield(subj.trial(t),'fixIdx') && ~isempty(subj.trial(t).fixIdx)
+    baseFixIdx = subj.trial(t).fixIdx(:);
 else
     error("No fixation indices for %s.", trialIDstr);
 end
+baseFixIdx = baseFixIdx(baseFixIdx>=1 & baseFixIdx<=numel(subj.event.fix));
 
-fixIdx = fixIdx(fixIdx>=1 & fixIdx<=numel(subj.event.fix));
-fix = subj.event.fix(fixIdx);
+% --- (B) read window 적용: readFixIdx와 교집합(정석) ---
+tOn = NaN; tPrompt = NaN;  % 이후 출력/표시에 재사용
+fixIdx = baseFixIdx;
 
-% validity 필터(있으면)
-if isfield(fix,'isValid')
-    keep = [fix.isValid]';
-    fix    = fix(keep);
-    fixIdx = fixIdx(keep);
+if useReadWindow
+    assert(isfield(subj.trial(t),'readFixIdx') && isfield(subj.trial(t),'readStart') && isfield(subj.trial(t),'readEnd'), ...
+        "read window fields missing. Run addReadWindowFromMsg(subj) first.");
+    assert(isfinite(subj.trial(t).readStart) && isfinite(subj.trial(t).readEnd), ...
+        "readStart/readEnd NaN for this trial.");
+
+    tOn     = subj.trial(t).readStart;
+    tPrompt = subj.trial(t).readEnd;
+
+    rwFixIdx = subj.trial(t).readFixIdx(:);
+    rwFixIdx = rwFixIdx(rwFixIdx>=1 & rwFixIdx<=numel(subj.event.fix));
+    assert(all(ismember(rwFixIdx, baseFixIdx)), "readFixIdx not subset of trial fixIdx/fixIdxDurClean. addReadWindowFromMsg version mismatch?");
+
+    % dur-clean을 유지하면서 read window만 보기: 교집합 (순서 보존)
+    fixIdx = intersect(fixIdx, rwFixIdx, 'stable');
+
+    assert(~isempty(fixIdx), "No fixations left after applying read window (readFixIdx).");
+    fprintf('[WIN] read window: [%.0f..%.0f] ms | keptFix=%d\n', tOn, tPrompt, numel(fixIdx));
 end
-assert(~isempty(fix), "No valid fixations left for %s.", trialIDstr);
 
-% 시간순 정렬
-if isfield(fix,'onset')
-    [~, srt] = sort([fix.onset]');
-    fix    = fix(srt);
+% --- (B) read window 적용 끝난 뒤 fixIdx가 결정된 상태 ---
+
+% validity 필터: fixIdx 레벨에서 먼저 (정석)
+if isfield(subj.event.fix, 'isValid')
+    fixIdx = fixIdx([subj.event.fix(fixIdx).isValid]');
+end
+assert(~isempty(fixIdx), "No valid fixations left for %s.", trialIDstr);
+
+% 시간순 정렬: fixIdx 기준
+if isfield(subj.event.fix,'onset')
+    [~, srt] = sort([subj.event.fix(fixIdx).onset]');
     fixIdx = fixIdx(srt);
 end
+
+% 이제 fix를 뽑기
+fix = subj.event.fix(fixIdx);
 
 % duration(점 크기)
 if isfield(fix,'dur')
@@ -96,10 +123,12 @@ else
 end
 
 srcName = "fixIdx";
-if useDurClean, srcName = "fixIdxDurClean"; end
+if useDurClean,   srcName = "fixIdxDurClean"; end
+if useReadWindow, srcName = srcName + "∩readFixIdx"; end
+if isfield(subj.event.fix,'isValid'), srcName = srcName + "∩isValid"; end
 fprintf('[FIXSRC] %s (n=%d)\n', srcName, numel(fix));
 
-%% 2-1) Raw vs Corr 모드 선택 + dx/dy(median) 계산 (필터 전에 dx/dy 산출용)
+%% 2-1) Raw vs Corr 모드 선택 + dx/dy(median) 계산
 hasCorrFields = isfield(fix,'xCorr') && isfield(fix,'yCorr') && isfield(fix,'x') && isfield(fix,'y');
 
 useCorr = false;
@@ -116,36 +145,7 @@ else
     dxMed_all = NaN; dyMed_all = NaN;
 end
 
-%% ===== SENTENCE_ONSET ~ PROMPT_ONSET(미포함) fixation만 남기기 =====
-t = tSubj;
-tOn = NaN; tPrompt = NaN;
-
-if onlySentenceBeforePrompt
-    assert(isfield(subj.trial(t),'sentenceOnset') && isfinite(subj.trial(t).sentenceOnset), ...
-        'sentenceOnset missing/NaN for this trial');
-    tOn = subj.trial(t).sentenceOnset;
-
-    msgIdxT = subj.trial(t).msgIdx(:);
-    txtM = string({subj.event.msg(msgIdxT).text})';
-    timM = [subj.event.msg(msgIdxT).time]';
-    pIdx = find(contains(txtM,"PROMPT_ONSET",'IgnoreCase',true), 1, 'first');
-    assert(~isempty(pIdx), 'PROMPT_ONSET not found in msgs');
-    tPrompt = timM(pIdx);
-
-    inWin = [fix.onset]' >= tOn & [fix.onset]' < tPrompt;
-
-    fix    = fix(inWin);
-    fixIdx = fixIdx(inWin);
-    dur    = dur(inWin);
-
-    assert(~isempty(fix), 'No fixation in SENTENCE_ONSET~PROMPT_ONSET window');
-
-    fprintf('[WIN] kept %d fix | rel=[%.0f %.0f] ms | window=SENTENCE_ONSET~PROMPT_ONSET(excl)\n', ...
-        numel(fix), min([fix.onset]'-tOn), max([fix.onset]'-tOn));
-end
-%% ================================================================
-
-%% 2-2) 최종 좌표 (필터 후) + dx/dy(median) 재계산(표시용)
+%% 2-2) 최종 좌표 + dx/dy(median) 재계산(표시용)
 if useCorr
     x = [fix.xCorr]';  y = [fix.yCorr]';
     dxMed = median([fix.xCorr]' - [fix.x]', 'omitnan');
@@ -237,7 +237,7 @@ else
 end
 
 winStr = "allFix";
-if onlySentenceBeforePrompt, winStr = "SENT~prePROMPT"; end
+if useReadWindow, winStr = sprintf('READWIN(%.0fms)', tPrompt-tOn); end
 
 title(sprintf('Scanpath: %s (subjIdx=%d, tw=%d, nFix=%d, %s, dx=%.1f, dy=%.1f, %s, %s)', ...
     string(subj.trial(tSubj).id), tSubj, tw, numel(x), coordMode, dxMed, dyMed, qcStr, winStr));
@@ -246,7 +246,7 @@ title(sprintf('Scanpath: %s (subjIdx=%d, tw=%d, nFix=%d, %s, dx=%.1f, dy=%.1f, %
 showPromptSample = false;
 if showPromptSample
 
-    % screenW/H: subj.displayRect 우선, 없으면 results.resolution 우선 (마지막 fallback은 NaN 유지)
+    % screenW/H: subj.displayRect 우선, 없으면 results.resolution 우선
     screenW = NaN; screenH = NaN;
     if isfield(subj,'displayRect') && numel(subj.displayRect)==4 && all(isfinite(subj.displayRect))
         screenW = subj.displayRect(3) - subj.displayRect(1) + 1;
@@ -259,30 +259,38 @@ if showPromptSample
         screenH = results.resolution(2);
     end
 
-    % PROMPT_ONSET 시간 (이미 위에서 찾았으면 재사용)
-    if ~isfinite(tPrompt)
+    % PROMPT_ONSET 시간: read window 사용 시 readEnd 재사용
+    if useReadWindow
+        tPrompt_local = subj.trial(t).readEnd;
+    else
+        tPrompt_local = NaN;
         msgIdxT = subj.trial(t).msgIdx(:);
         txtM = string({subj.event.msg(msgIdxT).text})';
         timM = [subj.event.msg(msgIdxT).time]';
         pIdx = find(contains(txtM,"PROMPT_ONSET",'IgnoreCase',true), 1, 'first');
-        if ~isempty(pIdx), tPrompt = timM(pIdx); end
+        if ~isempty(pIdx), tPrompt_local = timM(pIdx); end
     end
 
-    if isfinite(tPrompt)
+    if isfinite(tPrompt_local)
+        % sample idx도 read window 기반이 있으면 그것을 우선 사용해도 됨(선택)
         sIdx = subj.trial(t).sampleIdx(:);
         sIdx = sIdx(sIdx>=1 & sIdx<=numel(subj.sample.time));
         st = subj.sample.time(sIdx);
 
-        near = st >= (tPrompt-50) & st < tPrompt;
+        near = st >= (tPrompt_local-50) & st < tPrompt_local;
 
-        gx = subj.sample.gx(sIdx);
-        gy = subj.sample.gy(sIdx);
+        if isfield(subj.sample,'gxCorr') && isfield(subj.sample,'gyCorr')
+            gx = subj.sample.gxCorr(sIdx);
+            gy = subj.sample.gyCorr(sIdx);
+        else
+            gx = subj.sample.gx(sIdx);
+            gy = subj.sample.gy(sIdx);
+        end
 
         if any(near)
             xRaw = median(gx(near),'omitnan');
             yRaw = median(gy(near),'omitnan');
 
-            % 정규화 판별: 0~1 범위면 norm 후보, 단 screenW/H가 있어야 px 변환 가능
             isNorm01 = isfinite(xRaw) && isfinite(yRaw) && xRaw>=0 && xRaw<=1 && yRaw>=0 && yRaw<=1;
 
             if isNorm01 && isfinite(screenW) && isfinite(screenH)
@@ -321,4 +329,3 @@ end
 
 legend([hROI hScan hFix hStart hEnd],'Location','bestoutside');
 hold off;
-

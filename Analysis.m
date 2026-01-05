@@ -459,52 +459,29 @@ title('Drift offset Y per trial');
 lineYRange = [500 620];
 subj = cleanFixations(subj, [0 0 1920 1080], lineYRange, 50, 70);
 
-% 5. fixation → word ROI 매핑
-paddingPx = 2;
-% subj = mapFixationsToWordROIs(subj, results.wordRects, paddingPx);
+% 5. fixation → word ROI 매핑 (main-only 224 → all trials 234 안전 확장)
+paddingPx = 10;   % 진단 결과 가장 안정적이었던 값
 
-% === 옵션 1: Main trial만 ROI 매핑 (subj↔results 매핑 사용) ===
-mainIdx = find(isMainTrial);                % subj.trial에서 main인 trial 번호들
-subj2res = nan(numel(subj.trial),1);
-subj2res(mainIdx) = 1:numel(mainIdx);       % main-only results 인덱스(1..224)로 매핑
+ids = string({subj.trial.id})';
+isMainTrial = startsWith(ids,"TRIALID","IgnoreCase",true);
+mainIdx = find(isMainTrial);
 
-paddingPx = 2;
+assert(numel(results.wordRects)==numel(mainIdx), ...
+    "mainIdx(%d) != results.wordRects(%d)", numel(mainIdx), numel(results.wordRects));
 
-for k = 1:numel(mainIdx)
-    tSubj = mainIdx(k);                     % subj.trial index
-    tw    = subj2res(tSubj);                % results index (1..224)
+wordRectsCell = cell(numel(subj.trial),1);
+wordRectsCell(mainIdx) = results.wordRects;
 
-    rects = results.wordRects{tw};          % ✅ 이제 올바른 인덱스
-    if isempty(rects), continue; end
+% mapFixationsToWordROIs는 항상 덮어쓰기 → 표준은 리셋 후 재매핑
+for k=1:numel(subj.event.fix), subj.event.fix(k).word = 0; end
 
-    fixIdx = subj.trial(tSubj).fixIdx(:);
-    fixIdx = fixIdx(fixIdx>0 & fixIdx<=numel(subj.event.fix));
-    if isempty(fixIdx), continue; end
+subj = mapFixationsToWordROIs(subj, wordRectsCell, paddingPx);
 
-    if isfield(subj.event.fix, "xCorr")
-        x = [subj.event.fix(fixIdx).xCorr]';
-        y = [subj.event.fix(fixIdx).yCorr]';
-    else
-        x = [subj.event.fix(fixIdx).x]';
-        y = [subj.event.fix(fixIdx).y]';
-    end
-
-    L = rects(:,1) - paddingPx;  T = rects(:,2) - paddingPx;
-    R = rects(:,3) + paddingPx;  B = rects(:,4) + paddingPx;
-
-    w = zeros(numel(fixIdx),1);
-    for wi = 1:size(rects,1)
-        hit = (x>=L(wi) & x<=R(wi) & y>=T(wi) & y<=B(wi));
-        w(hit & w==0) = wi;
-    end
-
-    for ii = 1:numel(fixIdx)
-        subj.event.fix(fixIdx(ii)).word = w(ii);
-    end
-end
-
-assert(isfield(subj.event.fix,'word'), ...
-    "fix.word missing: ROI mapping did not create subj.event.fix.word");
+assert(isfield(subj.event.fix,'word'), "fix.word missing after ROI mapping");
+wAll = [subj.event.fix.word]';
+fprintf('[ROI map] padding=%d | word>0=%.3f | word==0=%.3f | nFix=%d\n', ...
+    paddingPx, mean(wAll>0), mean(wAll==0), numel(wAll));
+assert(numel(wAll)==numel(subj.event.fix), "word vector length mismatch");
 
 % 6. Fixation duration 기반 클리닝
 shortThresh = 60;
