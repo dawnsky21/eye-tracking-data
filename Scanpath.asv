@@ -1,0 +1,684 @@
+%% TRIALID Scanpath + ROI + 단어라벨 + fixation(scatter) + start/end
+%    + COORD모드표기 + word1 inROI QC
+%    + 읽기 구간(read window) 기반: readFixIdx / readStart / readEnd 사용
+%    + prePROMPT sample: gx/gy가 정규화(0~1)면 픽셀로 변환해서 표시(아니면 px로 간주)
+%
+% NOTE: ABC(LEFT/RIGHT) + gate 관련 코드는 완전 제거
+
+% ===== read window만 보기 =====
+useReadWindow = true;   % true: readFixIdx 기반 (SENTENCE_ONSET~PROMPT_ONSET)
+
+% 색
+scanBlue    = [0 0.4470 0.7410];
+startYellow = [0.9290 0.6940 0.1250];
+endOrange   = [0.8500 0.3250 0.0980];
+
+% fixation scatter 옵션
+dotSizeMode  = "dur";   % "fixed" 또는 "dur"
+dotSizeFixed = 40;
+dotSizeMin   = 20;
+dotSizeMax   = 120;
+
+%% === NEW: QC/Display Options ===
+gapThrMs      = 100;    % gap 정의
+longGapThrMs  = 1000;   % "긴 gap" 경고 기준
+gapShowTopK   = 3;      % 텍스트박스에 긴 gap 상위 몇 개 표시
+
+% (B) fixation-level validity rule (sample-based)
+useFixValidFromSamples = true;
+fixValidMinProp = 0.50; % fixation 구간 샘플 중 isValid 비율이 이 이상이면 fix valid
+
+% (C) read window robust handling
+fallbackReadFixIdxFromTime = true; % readFixIdx 없으면 onset/offset으로 생성
+
+% (regression 표시)
+showRegressionMarkers = false; % wordIdx 감소 지점 표시
+
+%% 0) 기본 전제 체크
+assert(exist("subj","var")==1 && isfield(subj,"trial") && isfield(subj,"event") && isfield(subj.event,"fix"), ...
+    "subj / subj.trial / subj.event.fix 필요");
+assert(exist("results","var")==1, "results 필요");
+
+%% 1) main trial 순번(1~224)으로 선택 → tSubj/tw 결정
+mainOrderWanted = 45;  % 1~224
+
+ids = string({subj.trial.id})';
+isMain = startsWith(ids,"TRIALID","IgnoreCase",true);
+mainIdx = find(isMain);
+
+assert(mainOrderWanted>=1 && mainOrderWanted<=numel(mainIdx), "mainOrderWanted out of range");
+
+tSubj = mainIdx(mainOrderWanted);  % subj trial index
+tw    = mainOrderWanted;           % results index(=main-only)
+
+fprintf("[MAIN] order=%d | %s | tSubj=%d | tw=%d\n", ...
+    mainOrderWanted, ids(tSubj), tSubj, tw);
+
+trialIDstr = ids(tSubj);   % 예: "TRIALID 179"
+
+%% 1-1) ROI(rects) / words(wlist): results{tw}
+assert(isfield(results,'wordRects') && tw>=1 && tw<=numel(results.wordRects) && ~isempty(results.wordRects{tw}), ...
+    "results.wordRects{%d} missing/empty (tw=tSubj)", tw);
+
+rects  = results.wordRects{tw};   % [L T R B]
+nWords = size(rects,1);
+
+wlist = string.empty(0,1);
+if isfield(results,'words') && tw<=numel(results.words) && ~isempty(results.words{tw})
+    wlist = string(results.words{tw});
+end
+
+if ~isempty(wlist)
+    fprintf('[SENT] %s | tw=%d | %s\n', trialIDstr, tw, strjoin(wlist," "));
+else
+    fprintf('[SENT] %s | tw=%d | (wlist empty)\n', trialIDstr, tw);
+end
+
+%% === SKIP FORMAL (single anchor: wordTbl.trial==tw, fallback tSubj) ===
+skipRateFormal = NaN;
+nWordsFormal   = NaN;
+
+if exist("wordTbl","var")==1 && istable(wordTbl)
+
+    % main-only 우선: tw
+    bestRows = wordTbl(wordTbl.trial==tw, :);
+
+    % fallback: tw가 비면 tSubj
+    if isempty(bestRows)
+        bestRows = wordTbl(wordTbl.trial==tSubj, :);
+    end
+
+    if ~isempty(bestRows) && ismember("TVT", bestRows.Properties.VariableNames)
+        tvt = bestRows.TVT;
+        nWordsFormal = sum(isfinite(tvt));
+        if nWordsFormal > 0
+            skipRateFormal = mean(tvt==0 & isfinite(tvt));
+        end
+    end
+end
+
+if isfinite(skipRateFormal)
+    fprintf('[SKIP] formal(skipRate from wordTbl TVT==0) = %.3f (%.1f%%) | nWords=%d\n', ...
+        skipRateFormal, 100*skipRateFormal, nWordsFormal);
+else
+    fprintf('[SKIP] formal skipRate unavailable (wordTbl missing or no matching trial/TVT)\n');
+end
+
+%% 2) fixations (subj.trial(tSubj)에서 추출)
+t = tSubj;
+
+% --- (A) base fixation source: dur-clean 우선 (원래 로직 유지) ---
+useDurClean = false;
+if isfield(subj.trial(t),'fixIdxDurClean') && ~isempty(subj.trial(t).fixIdxDurClean)
+    baseFixIdx = subj.trial(t).fixIdxDurClean(:);
+    useDurClean = true;
+elseif isfield(subj.trial(t),'fixIdx') && ~isempty(subj.trial(t).fixIdx)
+    baseFixIdx = subj.trial(t).fixIdx(:);
+else
+    error("No fixation indices for %s.", trialIDstr);
+end
+baseFixIdx = baseFixIdx(baseFixIdx>=1 & baseFixIdx<=numel(subj.event.fix));
+
+%% --- (B) read window 적용: readFixIdx와 교집합(정석) ---
+tOn = NaN; tPrompt = NaN;  % 이후 출력/표시에 재사용
+fixIdx = baseFixIdx;
+
+if useReadWindow
+    % 1) readStart/readEnd: scalar OR vector 모두 허용 -> cover interval로 scalarize
+    hasRS = isfield(subj.trial(t),'readStart');
+    hasRE = isfield(subj.trial(t),'readEnd');
+
+    assert(hasRS && hasRE, "readStart/readEnd missing. Run addReadWindowFromMsg(subj) first.");
+
+    rs = double(subj.trial(t).readStart);
+    re = double(subj.trial(t).readEnd);
+
+    rs = rs(isfinite(rs));
+    re = re(isfinite(re));
+
+    assert(~isempty(rs) && ~isempty(re), "readStart/readEnd are all NaN for this trial.");
+
+    tOn     = min(rs);
+    tPrompt = max(re);
+
+    assert(isfinite(tOn) && isfinite(tPrompt) && tPrompt > tOn, "Invalid read window after scalarize.");
+
+    % 2) readFixIdx: 있으면 사용, 없으면 (옵션) fixation onset/offset으로 생성
+    hasRF = isfield(subj.trial(t),'readFixIdx') && ~isempty(subj.trial(t).readFixIdx);
+
+    if hasRF
+        rwFixIdx = subj.trial(t).readFixIdx(:);
+        rwFixIdx = rwFixIdx(rwFixIdx>=1 & rwFixIdx<=numel(subj.event.fix));
+
+        % readFixIdx가 baseFixIdx subset인지 확인(버전 mismatch 잡기)
+        assert(all(ismember(rwFixIdx, baseFixIdx)), ...
+            "readFixIdx not subset of trial fixIdx/fixIdxDurClean. addReadWindowFromMsg version mismatch?");
+    else
+        if ~fallbackReadFixIdxFromTime
+            error("readFixIdx missing and fallback disabled. Run addReadWindowFromMsg(subj) with readFixIdx support.");
+        end
+
+        % fallback: baseFixIdx 중에서 fixation interval이 read window와 겹치면 포함
+        fx = subj.event.fix(baseFixIdx);
+        on = double([fx.onset])';
+        off = double([fx.offset])';
+
+        rwKeep = (on <= tPrompt) & (off >= tOn); % interval overlap
+        rwFixIdx = baseFixIdx(rwKeep);
+    end
+
+    % 3) dur-clean 유지 + read window만 보기: 교집합(순서 보존)
+    fixIdx = intersect(fixIdx, rwFixIdx, 'stable');
+
+    assert(~isempty(fixIdx), "No fixations left after applying read window.");
+    fprintf('[WIN] read window: [%.0f..%.0f] ms | keptFix=%d\n', tOn, tPrompt, numel(fixIdx));
+end
+
+%% === NEW (B): fixation-level validity from sample.isValid ===
+% - subj.sample.isValid를 fixation 시간 구간으로 집계해서 fixValid를 만들고,
+%   그 기준(fixValidMinProp)으로 filtering
+if useFixValidFromSamples
+    assert(isfield(subj,'sample') && isfield(subj.sample,'time') && isfield(subj.sample,'isValid'), ...
+        "Need subj.sample.time and subj.sample.isValid to build fix-level validity.");
+
+    st = double(subj.sample.time(:));
+    sv = logical(subj.sample.isValid(:));
+
+    % 대상 fixation: 현재 fixIdx 후보들
+    fx = subj.event.fix(fixIdx);
+    fon = double([fx.onset])';
+    foff = double([fx.offset])';
+
+    fixValidProp = nan(numel(fixIdx),1);
+
+    % 각 fixation 시간 구간에 들어오는 sample들의 isValid 비율
+    % (속도: fixation 수가 크지 않아서 loop로 충분)
+    for k = 1:numel(fixIdx)
+        in = (st >= fon(k)) & (st <= foff(k));
+        if any(in)
+            fixValidProp(k) = mean(sv(in), 'omitnan');
+        else
+            fixValidProp(k) = NaN; % 샘플이 없으면 판단 불가
+        end
+    end
+
+    fixIsValid = isfinite(fixValidProp) & (fixValidProp >= fixValidMinProp);
+
+    % 필터 적용
+    fixIdx = fixIdx(fixIsValid);
+
+    assert(~isempty(fixIdx), "No fixations left after sample-based fix validity filter.");
+    fprintf('[FIXVALID] sample-based | thr=%.2f | kept=%d/%d | medianProp=%.2f\n', ...
+        fixValidMinProp, sum(fixIsValid), numel(fixIsValid), median(fixValidProp,'omitnan'));
+end
+
+% validity 필터: fixIdx 레벨에서 먼저 (정석)
+if isfield(subj.event.fix, 'isValid')
+    fixIdx = fixIdx([subj.event.fix(fixIdx).isValid]');
+end
+assert(~isempty(fixIdx), "No valid fixations left for %s.", trialIDstr);
+
+% 시간순 정렬: fixIdx 기준
+if isfield(subj.event.fix,'onset')
+    [~, srt] = sort([subj.event.fix(fixIdx).onset]');
+    fixIdx = fixIdx(srt);
+end
+
+% 이제 fix를 뽑기
+fix = subj.event.fix(fixIdx);
+
+%% === WORD SEQ (single anchor: define wFix once right after fix) ===
+wFix = [];
+hasWord = isfield(fix,'word');
+if hasWord
+    wFix = double([fix.word])';
+end
+
+% duration(점 크기)
+if isfield(fix,'dur')
+    dur = [fix.dur]';
+else
+    dur = nan(numel(fix),1);
+end
+
+srcName = "fixIdx";
+if useDurClean,   srcName = "fixIdxDurClean"; end
+if useReadWindow, srcName = srcName + "∩readFixIdx"; end
+if isfield(subj.event.fix,'isValid'), srcName = srcName + "∩isValid"; end
+fprintf('[FIXSRC] %s (n=%d)\n', srcName, numel(fix));
+
+%% 2-1) Raw vs Corr 모드 선택 + dx/dy(median) 계산
+hasCorrFields = isfield(fix,'xCorr') && isfield(fix,'yCorr') && isfield(fix,'x') && isfield(fix,'y');
+
+useCorr = false;
+if hasCorrFields
+    useCorr = all(isfinite([fix.xCorr]')) && all(isfinite([fix.yCorr]'));
+end
+
+if useCorr
+    coordMode = "CORR";
+    dxMed_all = median([fix.xCorr]' - [fix.x]', 'omitnan');
+    dyMed_all = median([fix.yCorr]' - [fix.y]', 'omitnan');
+else
+    coordMode = "RAW";
+    dxMed_all = NaN; dyMed_all = NaN;
+end
+
+%% 2-2) 최종 좌표 + dx/dy(median) 재계산(표시용)
+if useCorr
+    x = [fix.xCorr]';  y = [fix.yCorr]';
+    dxMed = median([fix.xCorr]' - [fix.x]', 'omitnan');
+    dyMed = median([fix.yCorr]' - [fix.y]', 'omitnan');
+else
+    x = [fix.x]';      y = [fix.y]';
+    dxMed = NaN; dyMed = NaN;
+end
+fprintf('[COORD] %s | dxMed=%.2f dyMed=%.2f (tw=%d)\n', coordMode, dxMed, dyMed, tw);
+
+%% === target/spillover wordIdx (single source: targetIdxMain, main-only tw) ===
+targetWi = NaN; spillWi = NaN;
+
+if exist("targetIdxMain","var")==1 && numel(targetIdxMain) >= tw && isfinite(targetIdxMain(tw)) && targetIdxMain(tw) > 0
+    targetWi = targetIdxMain(tw);
+    spillWi  = targetWi + 1;
+end
+
+% 범위 체크
+if ~(isfinite(targetWi) && targetWi>=1 && targetWi<=nWords), targetWi = NaN; end
+if ~(isfinite(spillWi)  && spillWi >=1 && spillWi <=nWords), spillWi  = NaN; end
+
+fprintf('[TARGET] wi=%s | [SPILLOVER] wi=%s\n', string(targetWi), string(spillWi));
+
+%% 3) word1 inROI QC (가능할 때만)
+word1InROI = NaN; word1N = 0;
+if hasWord && nWords>=1
+    isW1 = (wFix==1);
+    word1N = sum(isW1);
+
+    L1 = rects(1,1); T1 = rects(1,2); R1 = rects(1,3); B1 = rects(1,4);
+    if word1N > 0
+        word1InROI = mean( x(isW1)>=L1 & x(isW1)<=R1 & y(isW1)>=T1 & y(isW1)<=B1 );
+    end
+end
+
+if isfinite(word1InROI)
+    fprintf('[QC] word1 inROI = %d/%d (%.1f%%)\n', round(word1InROI*word1N), word1N, 100*word1InROI);
+else
+    fprintf('[QC] word1 inROI = NaN (no word mapping or no word1 fix)\n');
+end
+
+%% === NEW (A): rec segment overlap + long gap detection (trial-level) ===
+% recSegments: trial이 몇 개 rec 구간과 겹치는지
+recSegments = NaN;
+hasRec = isfield(subj,'event') && isfield(subj.event,'rec') && ~isempty(subj.event.rec) ...
+         && isfield(subj.event.rec,'startTime') && isfield(subj.event.rec,'endTime');
+
+if hasRec
+    recStart = double([subj.event.rec.startTime]);
+    recEnd   = double([subj.event.rec.endTime]);
+    recSegments = sum(recStart <= subj.trial(tSubj).endTime & recEnd >= subj.trial(tSubj).startTime);
+end
+
+% trial 내부 sample gap 검사 (긴 gap 상위 K개)
+longGaps = [];
+longGapMax = NaN;
+
+if isfield(subj.trial(tSubj),'sampleIdx') && ~isempty(subj.trial(tSubj).sampleIdx)
+    sIdx = subj.trial(tSubj).sampleIdx(:);
+    sIdx = sIdx(sIdx>=1 & sIdx<=numel(subj.sample.time));
+    stT = double(subj.sample.time(sIdx));
+
+    if numel(stT) >= 2
+        dtT = diff(stT);
+        isLong = dtT >= longGapThrMs;
+        longGaps = dtT(isLong);
+        if ~isempty(longGaps)
+            longGapMax = max(longGaps);
+        end
+    end
+end
+
+warnRec = isfinite(recSegments) && recSegments > 1;
+warnGap = isfinite(longGapMax) && longGapMax >= longGapThrMs;
+
+if warnRec
+    fprintf('[WARN] recSegments=%d (trial spans multiple rec blocks)\n', recSegments);
+end
+if warnGap
+    fprintf('[WARN] long gap inside trial: max=%.0f ms (>= %d)\n', longGapMax, longGapThrMs);
+end
+
+%% 4) plot
+figure('Color','w'); hold on;
+
+% ROI boxes
+hROI = plot(nan,nan,'s','DisplayName','word ROI');
+for i = 1:nWords
+    L = rects(i,1); T = rects(i,2); R = rects(i,3); B = rects(i,4);
+
+    lw = 0.8;
+    if isfinite(targetWi) && i==targetWi, lw = 2.6; end
+    if isfinite(spillWi)  && i==spillWi,  lw = 2.6; end
+
+    rectangle('Position',[L T (R-L) (B-T)], 'LineWidth', lw);
+end
+
+% word labels
+if ~isempty(wlist)
+    minW = min(rects(:,3)-rects(:,1));
+    if minW < 35
+        fsz = 7;
+    elseif minW < 55
+        fsz = 8;
+    else
+        fsz = 10;
+    end
+
+    for i = 1:min(nWords,numel(wlist))
+        L = rects(i,1); T = rects(i,2); R = rects(i,3); B = rects(i,4);
+        text((L+R)/2, (T+B)/2, wlist(i), ...
+            'HorizontalAlignment','center','VerticalAlignment','middle', ...
+            'Interpreter','none','FontSize',fsz);
+    end
+end
+
+% scanpath
+hScan = plot(x,y,'-','LineWidth',1,'DisplayName','scanpath');
+set(hScan,'Color',scanBlue);
+
+% fixation scatter
+if strcmp(dotSizeMode,"dur") && all(~isnan(dur)) && numel(dur)>1
+    d0 = max(dur,1);
+    s  = dotSizeMin + (d0-min(d0))./max(eps,(max(d0)-min(d0))) * (dotSizeMax-dotSizeMin);
+else
+    s  = dotSizeFixed * ones(size(x));
+end
+hFix = scatter(x,y,s,'MarkerEdgeColor',scanBlue,'DisplayName','fixation locations');
+
+%% === NEW: emphasize fixations landing on target/spillover (outline overlay) ===
+if hasWord && (isfinite(targetWi) || isfinite(spillWi))
+    isTS = false(size(wFix));
+    if isfinite(targetWi), isTS = isTS | (wFix==targetWi); end
+    if isfinite(spillWi),  isTS = isTS | (wFix==spillWi);  end
+
+    if any(isTS)
+        scatter(x(isTS), y(isTS), s(isTS), ...
+            'MarkerFaceColor','none', ...
+            'MarkerEdgeColor',[0 0 0], ...
+            'LineWidth', 1.8, ...
+            'DisplayName','target/spillover fix');
+    end
+end
+
+%% === NEW: target highlight + regression markers ===
+% word index sequence (가능할 때)
+wFix = [];
+hasWord = isfield(fix,'word');
+if hasWord
+    wFix = double([fix.word])';
+end
+
+% (regression) wordIdx 감소 지점 표시
+if showRegressionMarkers && hasWord && ~isempty(wFix)
+    % regression: 다음 fixation이 더 작은 wordIdx로 가는 순간
+    % (word==0/NaN은 제외)
+    w = wFix;
+    w(~isfinite(w)) = 0;
+
+    regStep = false(numel(w)-1,1);
+    for i = 1:numel(w)-1
+        if w(i)>0 && w(i+1)>0 && w(i+1) < w(i)
+            regStep(i) = true;
+        end
+    end
+
+    if any(regStep)
+        idxMark = find(regStep) + 1; % "regression landing" fixation에 마커
+        plot(x(idxMark), y(idxMark), 'o', 'MarkerSize', 10, 'LineWidth', 2.0, 'DisplayName', 'regression');
+        fprintf('[REG] regression steps marked: %d\n', numel(idxMark));
+    end
+end
+
+%% === NEW: regression arrows to returned word ROI ===
+showRegArrows = true;
+
+if showRegArrows && hasWord
+    wv = wFix;
+
+    % 유효한 word만(0/NaN 제거)로 regression 판단
+    valid = isfinite(wFix) & (wFix>=1);
+    wv = wFix; wv(~valid) = NaN;
+
+    % regression: word decreases from previous fixation
+    reg = false(size(wv));
+    for i=2:numel(wv)
+        if isfinite(wv(i)) && isfinite(wv(i-1)) && (wv(i) < wv(i-1))
+            reg(i) = true;   % i번째 fixation이 "되돌아간 지점"
+        end
+    end
+
+    if any(reg)
+        idxReg = find(reg);
+
+        for ii = 1:numel(idxReg)
+            iFix = idxReg(ii);
+            wi = wv(iFix);
+
+            if ~(wi>=1 && wi<=nWords), continue; end
+
+            % 되돌아간 단어 ROI 중심
+            L = rects(wi,1); T = rects(wi,2); R = rects(wi,3); B = rects(wi,4);
+            cx = (L+R)/2; cy = (T+B)/2;
+
+            % 화살표: fixation 위치 -> ROI center
+            % (quiver는 축 좌표계 그대로, 보기 좋게 head 포함)
+            dx = cx - x(iFix);
+            dy = cy - y(iFix);
+
+            quiver(x(iFix), y(iFix), dx, dy, 0, ...
+                'LineWidth', 1.6, ...
+                'MaxHeadSize', 0.6, ...
+                'AutoScale', 'off');
+
+            % 되돌아간 fixation 자체도 마커로 강조(테두리)
+            plot(x(iFix), y(iFix), 'o', ...
+                'MarkerSize', 10, ...
+                'LineWidth', 1.8);
+        end
+
+        fprintf('[REG] regressions marked: %d\n', numel(idxReg));
+    else
+        fprintf('[REG] no regressions detected (wordIdx never decreased)\n');
+    end
+end
+
+% fixation order numbers
+for i = 1:numel(x)
+    text(x(i), y(i), sprintf(' %d', i), 'FontSize', 10, 'VerticalAlignment','bottom');
+end
+
+% start/end
+hStart = plot(x(1),y(1),'d','MarkerSize',10,'LineWidth',2,'MarkerEdgeColor',startYellow,'DisplayName','start fixation');
+hEnd   = plot(x(end),y(end),'s','MarkerSize',10,'LineWidth',2,'MarkerEdgeColor',endOrange,'DisplayName','end fixation');
+
+% axes
+set(gca,'YDir','reverse'); axis equal; grid on;
+xlabel('X (px)'); ylabel('Y (px)');
+
+% 제목: 모드 + drift + QC + 윈도우 정보
+if isfinite(word1InROI)
+    qcStr = sprintf('w1inROI=%.0f%%(n=%d)', 100*word1InROI, word1N);
+else
+    qcStr = 'w1inROI=NaN';
+end
+
+winStr = "allFix";
+if useReadWindow, winStr = sprintf('READWIN(%.0fms)', tPrompt-tOn); end
+
+title(sprintf('Scanpath: %s (subjIdx=%d, tw=%d, nFix=%d, %s, dx=%.1f, dy=%.1f, %s, %s)', ...
+    string(subj.trial(tSubj).id), tSubj, tw, numel(x), coordMode, dxMed, dyMed, qcStr, winStr));
+
+%% === NEW: QC metrics textbox (paper-friendly) ===
+% readingTimeMs: (가장 안전) read window에서 남은 fix들의 dur 합
+readingTimeMs = sum(dur, 'omitnan');
+
+% skipRate (근사): word별로 fix가 1개라도 있으면 "visited"
+skipRate = NaN;
+if ~isempty(wFix) && nWords > 0
+    visited = false(nWords,1);
+    for wi = 1:nWords
+        visited(wi) = any(wFix == wi);
+    end
+    skipRate = mean(~visited);
+end
+
+% 긴 gap 요약 문자열
+gapStr = "noLongGap";
+if warnGap
+    lg = sort(longGaps,'descend');
+    lg = lg(1:min(gapShowTopK, numel(lg)));
+    gapStr = sprintf('longGapMax=%.0fms (top:%s)', longGapMax, strjoin(string(round(lg)),"/"));
+end
+
+recStr = "recSeg=?";
+if isfinite(recSegments)
+    recStr = sprintf('recSeg=%d', recSegments);
+end
+
+% drift dx/dy는 이미 dxMed/dyMed에 있음 (CORR이면 숫자, RAW면 NaN)
+dxStr = "dx=?";
+dyStr = "dy=?";
+if isfinite(dxMed), dxStr = sprintf('dx=%.1f', dxMed); end
+if isfinite(dyMed), dyStr = sprintf('dy=%.1f', dyMed); end
+
+qcW1 = "w1inROI=?";
+if isfinite(word1InROI)
+    qcW1 = sprintf('w1inROI=%.0f%%(n=%d)', 100*word1InROI, word1N);
+end
+
+skStr = "skipRate=?";
+if isfinite(skipRateFormal)
+    skStr = sprintf('skipRateFormal=%.2f', skipRateFormal);
+elseif isfinite(skipRate)
+    skStr = sprintf('skipRateApprox=%.2f', skipRate);
+end
+
+
+rtStr = sprintf('readFixTime=%.0fms', readingTimeMs);
+
+tgtStr = "";
+if isfinite(targetWi) || isfinite(spillWi)
+    tgtStr = sprintf('targetWi=%s | spillWi=%s', string(targetWi), string(spillWi));
+end
+
+txt = sprintf(['%s | %s | %s %s\n' ...
+               'nFix=%d | %s | %s\n' ...
+               '%s %s'], ...
+               coordMode, recStr, dxStr, dyStr, ...
+               numel(x), rtStr, skStr, ...
+               qcW1, gapStr);
+
+% 텍스트 박스: 좌상단 고정
+annotation('textbox',[0.02 0.75 0.35 0.22], ...
+    'String', txt, ...
+    'FitBoxToText','on', ...
+    'BackgroundColor','w', ...
+    'EdgeColor',[0.3 0.3 0.3], ...
+    'LineWidth',1.0, ...
+    'Interpreter','none');
+
+if strlength(tgtStr) > 0
+    annotation('textbox',[0.02 0.70 0.20 0.05], ...
+        'String', tgtStr, 'FitBoxToText','on', ...
+        'BackgroundColor','w', 'EdgeColor',[0.3 0.3 0.3], ...
+        'LineWidth',1.0, 'Interpreter','none');
+end
+
+%% ===== prePROMPT sample 표시: norm->px + (CORR면) dx/dy 적용 =====
+showPromptSample = false;
+if showPromptSample
+
+    % screenW/H: subj.displayRect 우선, 없으면 results.resolution 우선
+    screenW = NaN; screenH = NaN;
+    if isfield(subj,'displayRect') && numel(subj.displayRect)==4 && all(isfinite(subj.displayRect))
+        screenW = subj.displayRect(3) - subj.displayRect(1) + 1;
+        screenH = subj.displayRect(4) - subj.displayRect(2) + 1;
+    elseif isfield(results,'dp') && isfield(results.dp,'resolution') && numel(results.dp.resolution)>=2
+        screenW = results.dp.resolution(1);
+        screenH = results.dp.resolution(2);
+    elseif isfield(results,'resolution') && numel(results.resolution)>=2
+        screenW = results.resolution(1);
+        screenH = results.resolution(2);
+    end
+
+    % PROMPT_ONSET 시간: read window 사용 시 readEnd 재사용
+    if useReadWindow
+        tPrompt_local = subj.trial(t).readEnd;
+    else
+        tPrompt_local = NaN;
+        msgIdxT = subj.trial(t).msgIdx(:);
+        txtM = string({subj.event.msg(msgIdxT).text})';
+        timM = [subj.event.msg(msgIdxT).time]';
+        pIdx = find(contains(txtM,"PROMPT_ONSET",'IgnoreCase',true), 1, 'first');
+        if ~isempty(pIdx), tPrompt_local = timM(pIdx); end
+    end
+
+    if isfinite(tPrompt_local)
+        % sample idx도 read window 기반이 있으면 그것을 우선 사용해도 됨(선택)
+        sIdx = subj.trial(t).sampleIdx(:);
+        sIdx = sIdx(sIdx>=1 & sIdx<=numel(subj.sample.time));
+        st = subj.sample.time(sIdx);
+
+        near = st >= (tPrompt_local-50) & st < tPrompt_local;
+
+        if isfield(subj.sample,'gxCorr') && isfield(subj.sample,'gyCorr')
+            gx = subj.sample.gxCorr(sIdx);
+            gy = subj.sample.gyCorr(sIdx);
+        else
+            gx = subj.sample.gx(sIdx);
+            gy = subj.sample.gy(sIdx);
+        end
+
+        if any(near)
+            xRaw = median(gx(near),'omitnan');
+            yRaw = median(gy(near),'omitnan');
+
+            isNorm01 = isfinite(xRaw) && isfinite(yRaw) && xRaw>=0 && xRaw<=1 && yRaw>=0 && yRaw<=1;
+
+            if isNorm01 && isfinite(screenW) && isfinite(screenH)
+                xP = xRaw * screenW;
+                yP = yRaw * screenH;
+                srcTag = "norm01->px";
+            else
+                xP = xRaw;
+                yP = yRaw;
+                srcTag = "pxOrUnknown";
+            end
+
+            if coordMode=="CORR" && isfinite(dxMed_all) && isfinite(dyMed_all)
+                xP = xP + dxMed_all;
+                yP = yP + dyMed_all;
+                srcTag = srcTag + "+dxdy";
+            end
+
+            if isfinite(xP) && isfinite(yP)
+                hPre = plot(xP,yP,'p','MarkerSize',12,'LineWidth',2,'DisplayName','pre-PROMPT sample');
+                text(xP,yP,' prePROMPT','VerticalAlignment','bottom','Interpreter','none');
+                uistack(hPre,'top');
+                fprintf('[PREPROMPT] %s | median x=%.3f y=%.3f -> plot x=%.1f y=%.1f | n=%d\n', ...
+                    srcTag, xRaw, yRaw, xP, yP, sum(near));
+            else
+                fprintf('[PREPROMPT] invalid sample -> skip\n');
+            end
+        else
+            fprintf('[PREPROMPT] no samples in window\n');
+        end
+    else
+        fprintf('[PREPROMPT] PROMPT_ONSET not found -> skip\n');
+    end
+end
+%% =======================================================================
+showLegend = true;
+if showLegend
+    legend('Location','bestoutside');
+end

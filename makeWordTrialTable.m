@@ -1,4 +1,5 @@
-function wordTbl = makeWordTrialTable(subj, results)
+function wordTbl = makeWordTrialTable(subj, results, trialIdx)
+% trialIdx 없으면 전체 trial
 % makeWordTrialTable  trial × word 수준의 읽기 지표(FFD, GD, TVT 등) 계산
 %
 %   wordTbl = makeWordTrialTable(subj, results)
@@ -23,29 +24,36 @@ function wordTbl = makeWordTrialTable(subj, results)
 %       TVT             : Total Viewing Time (ms)
 %       firstFixOnset   : trial 시작 기준 첫 fixation onset (ms)
 
-    nTrials = numel(subj.trial);
-    rows = [];  % struct 배열로 모은 뒤 마지막에 table로 변환
+% ---- trialIdx 처리 (없으면 전체 trial) ----
+if nargin < 3 || isempty(trialIdx)
+    trialIdx = 1:numel(subj.trial);
+end
+trialIdx = unique(trialIdx(:)');                          % 중복 제거 + row
+trialIdx = trialIdx(trialIdx>=1 & trialIdx<=numel(subj.trial));  % 범위 방어
 
-    for t = 1:nTrials
-        % 이 trial에 ROI 정보가 없다면 스킵
-        if t > numel(results.wordRects) || isempty(results.wordRects{t})
-            continue;
-        end
+rows = [];  % struct 배열로 모은 뒤 마지막에 table로 변환
 
-        rects  = results.wordRects{t};
-        nWords = size(rects,1);
-        tr     = subj.trial(t);   % trial 정보 (startTime 포함)
+% ---- trial loop: trialIdx만 사용 ----
+for t = trialIdx
+    % 이 trial에 ROI 정보가 없다면 스킵
+    if ~isfield(results,'wordRects') || t > numel(results.wordRects) || isempty(results.wordRects{t})
+        continue;
+    end
 
-        % duration 클리닝 반영된 fixation 인덱스 사용
-        if ~isfield(subj.trial(t), 'fixIdxDurClean') || isempty(subj.trial(t).fixIdxDurClean)
-            if isfield(subj.trial(t), 'fixIdx') && ~isempty(subj.trial(t).fixIdx)
-                fixIdx = subj.trial(t).fixIdx(:)';
-            else
-                fixIdx = [];
-            end
+    rects  = results.wordRects{t};
+    nWords = size(rects,1);
+    tr     = subj.trial(t);   % trial 정보 (startTime 포함)
+
+    % duration 클리닝 반영된 fixation 인덱스 사용
+    if ~isfield(subj.trial(t), 'fixIdxDurClean') || isempty(subj.trial(t).fixIdxDurClean)
+        if isfield(subj.trial(t), 'fixIdx') && ~isempty(subj.trial(t).fixIdx)
+            fixIdx = subj.trial(t).fixIdx(:)';
         else
-            fixIdx = subj.trial(t).fixIdxDurClean(:)';
+            fixIdx = [];
         end
+    else
+        fixIdx = subj.trial(t).fixIdxDurClean(:)';
+    end
 
         % (1) 이 trial에서 사용할 fixation index 선택
         if isempty(fixIdx)

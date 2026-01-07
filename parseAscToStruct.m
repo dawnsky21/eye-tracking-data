@@ -57,15 +57,12 @@ function subj = parseAscToStruct(ascFile)
         tline = strtrim(lines{i});
         if isempty(tline), continue; end
 
-        % ===== NEW (2): DISPLAY_COORDS 파싱 (스킵 전에 먼저) =====
-        if startsWith(tline, 'DISPLAY_COORDS')
-            tok = regexp(tline, '^DISPLAY_COORDS\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', 'tokens', 'once');
-            if ~isempty(tok)
-                displayRect = cellfun(@str2double, tok);  % [L T R B]
-            end
+        % ===== DISPLAY_COORDS 파싱 (HEADER 또는 MSG 래핑 모두 허용) =====
+        tok = regexp(tline, 'DISPLAY_COORDS\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)', 'tokens', 'once');
+        if ~isempty(tok)
+            displayRect = cellfun(@str2double, tok);  % [L T R B], 예: [0 0 1919 1079]
             continue;
         end
-
 
         % ===== NEW (1): SAMPLES 라인 저장 + coordType 판정 (스킵 전에 먼저) =====
         if startsWith(tline, 'SAMPLES')
@@ -109,7 +106,7 @@ function subj = parseAscToStruct(ascFile)
 
         % 2) MSG 라인
         if startsWith(tline, 'MSG')
-            tok = regexp(tline, '^MSG\s+(\d+)\s+(.*)$', 'tokens', 'once');
+            tok = regexp(tline, '^MSG(?:→|\s)+(\d+)\s+(.*)$', 'tokens', 'once');
             if ~isempty(tok)
                 t    = str2double(tok{1});
                 text = strtrim(tok{2});
