@@ -113,8 +113,16 @@ function subj = mapFixationsToWordROIs(subj, wordRectsCell, paddingPx)
                 % 어떤 단어에도 안 들어감
                 subj.event.fix(fi).word = 0;
             else
-                % 여러 개에 걸치면 첫 번째 단어로 할당
-                w = inWord(1);
+                if numel(inWord)==1
+                    w = inWord;
+                else
+                    cx = (rectsPad(inWord,1) + rectsPad(inWord,3)) / 2;
+                    cy = (rectsPad(inWord,2) + rectsPad(inWord,4)) / 2;
+                    d2 = (fx - cx).^2 + (fy - cy).^2;
+                    [~,ix] = min(d2);   % 동률이면 첫 후보(작은 w)
+                    w = inWord(ix);
+                end
+
                 subj.event.fix(fi).word = w;
                 subj.trial(t).wordFixIdx{w}(end+1,1) = fi;
             end

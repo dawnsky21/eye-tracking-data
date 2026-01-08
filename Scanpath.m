@@ -40,7 +40,7 @@ assert(exist("subj","var")==1 && isfield(subj,"trial") && isfield(subj,"event") 
 assert(exist("results","var")==1, "results 필요");
 
 %% 1) main trial 순번(1~224)으로 선택 → tSubj/tw 결정
-mainOrderWanted = 97;  % 1~224
+mainOrderWanted = 24;  % 1~224
 
 ids = string({subj.trial.id})';
 isMain = startsWith(ids,"TRIALID","IgnoreCase",true);
@@ -60,8 +60,30 @@ trialIDstr = ids(tSubj);   % 예: "TRIALID 179"
 assert(isfield(results,'wordRects') && tw>=1 && tw<=numel(results.wordRects) && ~isempty(results.wordRects{tw}), ...
     "results.wordRects{%d} missing/empty (tw=tSubj)", tw);
 
-rects  = results.wordRects{tw};   % [L T R B]
+rectsPad = subj.trial(tSubj).wordRects;
+
+% (분석/QC/타겟판정용 기준 ROI)  ← 이건 그대로 pad 유지
+rects = rectsPad;
 nWords = size(rects,1);
+
+% ---- NEW: plot 전용 ROI (가로만 줄이기) ----
+padMap = 30;    % 너의 ROI 매핑에 사용한 paddingPx (Analysis에서 강제한 값)
+padViz = 0;    % 플롯에서만 보이는 padding (겹침 줄이기용)
+
+rectsViz = rectsPad;
+shrinkX = (padMap - padViz);      % 좌우에서 되돌릴 양
+
+rectsViz(:,1) = rectsPad(:,1) + shrinkX;   % L
+rectsViz(:,3) = rectsPad(:,3) - shrinkX;   % R
+% 세로는 그대로
+rectsViz(:,2) = rectsPad(:,2);             % T
+rectsViz(:,4) = rectsPad(:,4);             % B
+
+% 안전장치: 너무 줄여서 L>=R 되면 원래 pad로 복구
+bad = rectsViz(:,1) >= rectsViz(:,3);
+if any(bad)
+    rectsViz(bad,:) = rectsPad(bad,:);
+end
 
 wlist = string.empty(0,1);
 if isfield(results,'words') && tw<=numel(results.words) && ~isempty(results.words{tw})
@@ -104,121 +126,117 @@ else
     fprintf('[SKIP] formal skipRate unavailable (wordTbl missing or no matching trial/TVT)\n');
 end
 
-%% 2) fixations (subj.trial(tSubj)에서 추출)
+%% 2) fixations (single anchor: fixIdx is defined ONCE)
 t = tSubj;
 
-% --- (A) base fixation source: dur-clean 우선 (원래 로직 유지) ---
-useDurClean = false;
-if isfield(subj.trial(t),'fixIdxDurClean') && ~isempty(subj.trial(t).fixIdxDurClean)
-    baseFixIdx = subj.trial(t).fixIdxDurClean(:);
-    useDurClean = true;
-elseif isfield(subj.trial(t),'fixIdx') && ~isempty(subj.trial(t).fixIdx)
-    baseFixIdx = subj.trial(t).fixIdx(:);
-else
-    error("No fixation indices for %s.", trialIDstr);
-end
-baseFixIdx = baseFixIdx(baseFixIdx>=1 & baseFixIdx<=numel(subj.event.fix));
+% ---- (A) ALWAYS start from RAW fixIdx (same indexing system as readFixIdx) ----
+assert(isfield(subj.trial(t),'fixIdx') && ~isempty(subj.trial(t).fixIdx), "No subj.trial(t).fixIdx");
+fixIdx_raw = subj.trial(t).fixIdx(:);
+fixIdx_raw = fixIdx_raw(fixIdx_raw>=1 & fixIdx_raw<=numel(subj.event.fix));
 
-%% --- (B) read window 적용: readFixIdx와 교집합(정석) ---
-tOn = NaN; tPrompt = NaN;  % 이후 출력/표시에 재사용
-fixIdx = baseFixIdx;
+% ---- (B) optional dur-clean list (post-filter only) ----
+hasDC = isfield(subj.trial(t),'fixIdxDurClean') && ~isempty(subj.trial(t).fixIdxDurClean);
+fixIdx_dc = [];
+if hasDC
+    fixIdx_dc = subj.trial(t).fixIdxDurClean(:);
+    fixIdx_dc = fixIdx_dc(fixIdx_dc>=1 & fixIdx_dc<=numel(subj.event.fix));
+end
+
+% ---- SINGLE ANCHOR: start fixIdx here, and never redefine later ----
+fixIdx = fixIdx_raw;
+srcName = "fixIdx(raw)";
+
+% ---- (C) read window (RAW space) ----
+tOn = NaN; tPrompt = NaN;
 
 if useReadWindow
-    % 1) readStart/readEnd: scalar OR vector 모두 허용 -> cover interval로 scalarize
-    hasRS = isfield(subj.trial(t),'readStart');
-    hasRE = isfield(subj.trial(t),'readEnd');
+    % readStart/readEnd -> scalarize
+    assert(isfield(subj.trial(t),'readStart') && isfield(subj.trial(t),'readEnd'), ...
+        "readStart/readEnd missing. Run addReadWindowFromMsg(subj) first.");
 
-    assert(hasRS && hasRE, "readStart/readEnd missing. Run addReadWindowFromMsg(subj) first.");
-
-    rs = double(subj.trial(t).readStart);
-    re = double(subj.trial(t).readEnd);
-
-    rs = rs(isfinite(rs));
-    re = re(isfinite(re));
-
+    rs = double(subj.trial(t).readStart); rs = rs(isfinite(rs));
+    re = double(subj.trial(t).readEnd);   re = re(isfinite(re));
     assert(~isempty(rs) && ~isempty(re), "readStart/readEnd are all NaN for this trial.");
 
     tOn     = min(rs);
     tPrompt = max(re);
-
     assert(isfinite(tOn) && isfinite(tPrompt) && tPrompt > tOn, "Invalid read window after scalarize.");
 
-    % 2) readFixIdx: 있으면 사용, 없으면 (옵션) fixation onset/offset으로 생성
+    % readFixIdx 있으면 사용, 없으면 (옵션) 시간 overlap fallback
     hasRF = isfield(subj.trial(t),'readFixIdx') && ~isempty(subj.trial(t).readFixIdx);
 
     if hasRF
         rwFixIdx = subj.trial(t).readFixIdx(:);
         rwFixIdx = rwFixIdx(rwFixIdx>=1 & rwFixIdx<=numel(subj.event.fix));
-
-        % readFixIdx가 baseFixIdx subset인지 확인(버전 mismatch 잡기)
-        assert(all(ismember(rwFixIdx, baseFixIdx)), ...
-            "readFixIdx not subset of trial fixIdx/fixIdxDurClean. addReadWindowFromMsg version mismatch?");
     else
         if ~fallbackReadFixIdxFromTime
             error("readFixIdx missing and fallback disabled. Run addReadWindowFromMsg(subj) with readFixIdx support.");
         end
-
-        % fallback: baseFixIdx 중에서 fixation interval이 read window와 겹치면 포함
-        fx = subj.event.fix(baseFixIdx);
-        on = double([fx.onset])';
+        fx  = subj.event.fix(fixIdx_raw);
+        on  = double([fx.onset])';
         off = double([fx.offset])';
-
-        rwKeep = (on <= tPrompt) & (off >= tOn); % interval overlap
-        rwFixIdx = baseFixIdx(rwKeep);
+        rwKeep  = (on <= tPrompt) & (off >= tOn);
+        rwFixIdx = fixIdx_raw(rwKeep);
     end
 
-    % 3) dur-clean 유지 + read window만 보기: 교집합(순서 보존)
+    % IMPORTANT: intersect in RAW space
     fixIdx = intersect(fixIdx, rwFixIdx, 'stable');
-
-    assert(~isempty(fixIdx), "No fixations left after applying read window.");
-    fprintf('[WIN] read window: [%.0f..%.0f] ms | keptFix=%d\n', tOn, tPrompt, numel(fixIdx));
+    srcName = srcName + "∩readWinRAW";
+    assert(~isempty(fixIdx), "No fixations left after applying read window (RAW).");
+    fprintf('[WIN] read window RAW: [%.0f..%.0f] ms | keptFix=%d\n', tOn, tPrompt, numel(fixIdx));
 end
 
-%% === NEW (B): fixation-level validity from sample.isValid ===
-% - subj.sample.isValid를 fixation 시간 구간으로 집계해서 fixValid를 만들고,
-%   그 기준(fixValidMinProp)으로 filtering
+% ---- (D) OPTIONAL: durClean post-filter (ONLY HERE) ----
+applyDurCleanPost = true;  % << 원하면 true, raw로 보고 싶으면 false
+if applyDurCleanPost && hasDC
+    fixIdx = intersect(fixIdx, fixIdx_dc, 'stable');
+    srcName = srcName + "∩durClean";
+    assert(~isempty(fixIdx), "No fixations left after durClean post-filter.");
+    fprintf('[WIN] + durClean post-filter: keptFix=%d\n', numel(fixIdx));
+end
+
+%% ---- (E) sample-based fixation validity (from subj.sample.isValid) ----
 if useFixValidFromSamples
     assert(isfield(subj,'sample') && isfield(subj.sample,'time') && isfield(subj.sample,'isValid'), ...
-        "Need subj.sample.time and subj.sample.isValid to build fix-level validity.");
+        "useFixValidFromSamples=true인데 subj.sample.time/isValid가 없음. addSampleValidity 먼저.");
 
-    st = double(subj.sample.time(:));
-    sv = logical(subj.sample.isValid(:));
+    % trial sample time
+    sIdx = subj.trial(t).sampleIdx(:);
+    sIdx = sIdx(sIdx>=1 & sIdx<=numel(subj.sample.time));
+    st  = double(subj.sample.time(sIdx));
+    sv  = logical(subj.sample.isValid(sIdx));
 
-    % 대상 fixation: 현재 fixIdx 후보들
-    fx = subj.event.fix(fixIdx);
-    fon = double([fx.onset])';
-    foff = double([fx.offset])';
+    % 각 fixation 구간에서 valid sample 비율 계산
+    fx  = subj.event.fix(fixIdx);
+    on  = double([fx.onset])';
+    off = double([fx.offset])';
 
     fixValidProp = nan(numel(fixIdx),1);
-
-    % 각 fixation 시간 구간에 들어오는 sample들의 isValid 비율
-    % (속도: fixation 수가 크지 않아서 loop로 충분)
-    for k = 1:numel(fixIdx)
-        in = (st >= fon(k)) & (st <= foff(k));
+    for ii = 1:numel(fixIdx)
+        in = (st >= on(ii)) & (st <= off(ii));
         if any(in)
-            fixValidProp(k) = mean(sv(in), 'omitnan');
-        else
-            fixValidProp(k) = NaN; % 샘플이 없으면 판단 불가
+            fixValidProp(ii) = mean(sv(in));
         end
     end
 
-    fixIsValid = isfinite(fixValidProp) & (fixValidProp >= fixValidMinProp);
+    keep = isfinite(fixValidProp) & (fixValidProp >= fixValidMinProp);
+    fprintf('[FIXVALID] sample-based | thr=%.2f | kept=%d/%d | medianProp=%.2f\n', ...
+        fixValidMinProp, sum(keep), numel(keep), median(fixValidProp, 'omitnan'));
 
-    % 필터 적용
-    fixIdx = fixIdx(fixIsValid);
+    fixIdx = fixIdx(keep);
+    srcName = srcName + "∩fixValidSamp";
 
     assert(~isempty(fixIdx), "No fixations left after sample-based fix validity filter.");
-    fprintf('[FIXVALID] sample-based | thr=%.2f | kept=%d/%d | medianProp=%.2f\n', ...
-        fixValidMinProp, sum(fixIsValid), numel(fixIsValid), median(fixValidProp,'omitnan'));
 end
 
-% validity 필터: fixIdx 레벨에서 먼저 (정석)
+% ---- (F) event-level validity 필터(있으면) ----
 if isfield(subj.event.fix, 'isValid')
     fixIdx = fixIdx([subj.event.fix(fixIdx).isValid]');
+    srcName = srcName + "∩isValid";
 end
-assert(~isempty(fixIdx), "No valid fixations left for %s.", trialIDstr);
+assert(~isempty(fixIdx), "No valid fixations left for %s.", string(subj.trial(t).id));
 
-% 시간순 정렬: fixIdx 기준
+% 시간순 정렬
 if isfield(subj.event.fix,'onset')
     [~, srt] = sort([subj.event.fix(fixIdx).onset]');
     fixIdx = fixIdx(srt);
@@ -226,6 +244,8 @@ end
 
 % 이제 fix를 뽑기
 fix = subj.event.fix(fixIdx);
+
+fprintf('[FIXSRC] %s (n=%d)\n', srcName, numel(fix));
 
 %% === WORD SEQ (single anchor: define wFix once right after fix) ===
 wFix = [];
@@ -240,12 +260,6 @@ if isfield(fix,'dur')
 else
     dur = nan(numel(fix),1);
 end
-
-srcName = "fixIdx";
-if useDurClean,   srcName = "fixIdxDurClean"; end
-if useReadWindow, srcName = srcName + "∩readFixIdx"; end
-if isfield(subj.event.fix,'isValid'), srcName = srcName + "∩isValid"; end
-fprintf('[FIXSRC] %s (n=%d)\n', srcName, numel(fix));
 
 %% 2-1) Raw vs Corr 모드 선택 + dx/dy(median) 계산
 hasCorrFields = isfield(fix,'xCorr') && isfield(fix,'yCorr') && isfield(fix,'x') && isfield(fix,'y');
@@ -351,15 +365,14 @@ end
 %% 4) plot
 figure('Color','w'); hold on;
 
-% ROI boxes
 hROI = plot(nan,nan,'s','DisplayName','word ROI');
-for i = 1:nWords
-    L = rects(i,1); T = rects(i,2); R = rects(i,3); B = rects(i,4);
+uistack(hROI,'bottom');
 
+for i = 1:nWords
+    L = rectsViz(i,1); T = rectsViz(i,2); R = rectsViz(i,3); B = rectsViz(i,4);
     lw = 0.8;
     if isfinite(targetWi) && i==targetWi, lw = 2.6; end
     if isfinite(spillWi)  && i==spillWi,  lw = 2.6; end
-
     rectangle('Position',[L T (R-L) (B-T)], 'LineWidth', lw);
 end
 
@@ -376,7 +389,7 @@ if ~isempty(wlist)
 
     for i = 1:min(nWords,numel(wlist))
         L = rects(i,1); T = rects(i,2); R = rects(i,3); B = rects(i,4);
-        text((L+R)/2, (T+B)/2, wlist(i), ...
+        text((L+R)/2, (T+B)/2, wlist(i), ...)
             'HorizontalAlignment','center','VerticalAlignment','middle', ...
             'Interpreter','none','FontSize',fsz);
     end
@@ -411,13 +424,6 @@ if hasWord && (isfinite(targetWi) || isfinite(spillWi))
 end
 
 %% === NEW: target highlight + regression markers ===
-% word index sequence (가능할 때)
-wFix = [];
-hasWord = isfield(fix,'word');
-if hasWord
-    wFix = double([fix.word])';
-end
-
 % (regression) wordIdx 감소 지점 표시
 if showRegressionMarkers && hasWord && ~isempty(wFix)
     % regression: 다음 fixation이 더 작은 wordIdx로 가는 순간
