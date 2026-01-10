@@ -255,12 +255,11 @@ ids = strtrim(ids);
 isPractice = startsWith(ids, "PRACTICE_TRIALID", "IgnoreCase", true);
 isMain     = startsWith(ids, "TRIALID",          "IgnoreCase", true);
 
-% ===== CANONICAL (do not overwrite later) =====
-mainTrialIdx = find(isMain);        % subj.trial 기준 MAIN 인덱스 (예: 11..234)
-practiceTrialIdx = find(isPractice);
+% ===== CANONICAL (pre-check only) =====
+mainTrialIdx_pre = find(isMain);
+practiceTrialIdx_pre = find(isPractice);
 
-% (선택) 즉시 확인
-assert(~isempty(mainTrialIdx), "No MAIN trials found.");
+assert(~isempty(mainTrialIdx_pre), "No MAIN trials found.");
 
 fprintf("nTrials total=%d | practice=%d | main=%d\n", numel(ids), sum(isPractice), sum(isMain));
 fprintf("ids sample: [%s] | [%s] | [%s]\n", ids(1), ids(min(10,end)), ids(min(11,end)));
@@ -269,7 +268,7 @@ assert(any(isPractice) && any(isMain), ...
     "Trial split failed: practice=%d main=%d", sum(isPractice), sum(isMain));
 
 % [CHECK-1] first/last MAIN id
-disp(ids(mainTrialIdx([1 numel(mainTrialIdx)])));
+disp(ids(mainTrialIdx_pre([1 numel(mainTrialIdx_pre)])));
 
 % ===== (3) MSG 토큰 빈도/샘플 출력: practice vs main 분리 진단 =====
 msgText = string({subj.event.msg.text})';
@@ -323,9 +322,9 @@ for s = need
 end
 
 % (F) main trial에서 PROMPT_ONSET 누락 trial 찾기 (핵심 QC)
-missingPrompt = false(numel(mainTrialIdx),1);
-for i=1:numel(mainTrialIdx)
-    t = mainTrialIdx(i);
+missingPrompt = false(numel(mainTrialIdx_pre),1);
+for i=1:numel(mainTrialIdx_pre)
+    t = mainTrialIdx_pre(i);
     mi = subj.trial(t).msgIdx(:);
     mi = mi(mi>=1 & mi<=numel(subj.event.msg));
     if isempty(mi), missingPrompt(i)=true; continue; end
@@ -334,7 +333,7 @@ for i=1:numel(mainTrialIdx)
 end
 fprintf('\n[CHECK] main trials missing PROMPT_ONSET: %d/%d\n', sum(missingPrompt), numel(missingPrompt));
 if any(missingPrompt)
-    disp(ids(mainTrialIdx(missingPrompt)));
+    disp(ids(mainTrialIdx_pre(missingPrompt)));
 end
 
 fprintf("nTrials total=%d | practice=%d | main=%d\n", numel(ids), sum(isPractice), sum(isMain));
@@ -402,7 +401,7 @@ fprintf('[AFTER applyDrift] gxCorr exists=%d | fix.xCorr exists=%d\n', ...
 %
 % ---- sanity check (시각 확인) ----
 % 몇 개 trial을 골라 raw vs corrected time–gx 플롯을 비교해본다.
-mainTrials = mainTrialIdx;
+mainTrials = mainTrialIdx_pre;
 pick = [1 5 10];
 pick = pick(pick <= numel(mainTrials));
 trialsToCheck = mainTrials(pick);
@@ -507,6 +506,47 @@ res2subj(:) = mainTrialIdx(:);
 
 fprintf("[P1] nTrials=%d | main=%d | nMain(wordRects)=%d\n", numel(subj.trial), numel(mainTrialIdx), nMain);
 
+%% ===== (A) READ WINDOW CLIP (OFFICIAL QC WINDOW) =====
+clipCfg = struct('marginX',80,'marginY',20); 
+marginX = clipCfg.marginX;
+marginY = clipCfg.marginY;
+
+% 안전 체크
+assert(exist('mainTrialIdx','var')==1 && ~isempty(mainTrialIdx), 'mainTrialIdx missing');
+assert(exist('subj2res','var')==1 && numel(subj2res)==numel(subj.trial), 'subj2res missing/mismatch');
+assert(isfield(results,'wordRects') && ~isempty(results.wordRects), 'results.wordRects missing');
+
+for tSubj = mainTrialIdx(:)'
+    subj.trial(tSubj).readFixIdxClipped = [];  % init
+
+    if ~isfield(subj.trial(tSubj),'readFixIdx') || isempty(subj.trial(tSubj).readFixIdx)
+        continue;
+    end
+
+    tw = subj2res(tSubj);
+    if ~isfinite(tw), continue; end
+
+    rects = results.wordRects{tw};
+    if isempty(rects) || size(rects,2)<4, continue; end
+
+    xMin = min(rects(:,1)) - marginX;  xMax = max(rects(:,3)) + marginX;
+    yMin = min(rects(:,2)) - marginY;  yMax = max(rects(:,4)) + marginY;
+
+    fi = subj.trial(tSubj).readFixIdx(:);
+    fi = fi(fi>=1 & fi<=numel(subj.event.fix));
+    if isempty(fi), continue; end
+
+    xF = nan(numel(fi),1); yF = nan(numel(fi),1);
+    for k=1:numel(fi)
+        f = subj.event.fix(fi(k));
+        if isfield(f,'xCorr') && isfinite(f.xCorr), xF(k)=f.xCorr; else, xF(k)=f.x; end
+        if isfield(f,'yCorr') && isfinite(f.yCorr), yF(k)=f.yCorr; else, yF(k)=f.y; end
+    end
+
+    keep = (xF>=xMin & xF<=xMax & yF>=yMin & yF<=yMax);
+    subj.trial(tSubj).readFixIdxClipped = fi(keep);
+end
+
 %% ===== [P2] ROI MAPPING (OFFICIAL): padding=30 =====
 paddingPx = 30;
 fprintf("[P2] paddingPx=%d (forced)\n", paddingPx);
@@ -521,6 +561,16 @@ if isfield(subj,'event') && isfield(subj.event,'fix') && ~isempty(subj.event.fix
     for k=1:numel(subj.event.fix), subj.event.fix(k).word = 0; end
 end
 subj = mapFixationsToWordROIs(subj, wordRectsCell, paddingPx);
+
+% (선택) clipped 전체 hit 로그: P1 안에서만!
+rw2 = [];
+for tSubj = mainTrialIdx(:)'
+    rw2 = [rw2; subj.trial(tSubj).readFixIdxClipped(:)]; %#ok<AGROW>
+end
+rw2 = unique(rw2);
+wAll = [subj.event.fix.word]';
+fprintf("[READ clipped] hit=%.3f | nFix=%d | mX=%d mY=%d\n", ...
+    mean(wAll(rw2)>0), numel(rw2), marginX, marginY);
 
 % ===== [P2b] DURATION CLEAN (OFFICIAL): must run AFTER ROI mapping =====
 shortThresh = 60;
@@ -684,55 +734,370 @@ tRows = wordTbl.isTarget | wordTbl.isSpillover;
 fprintf("[CHECK target+spill] rows=%d | nFix>0=%.3f | skipped=%.3f\n", ...
     sum(tRows), mean(wordTbl.nFix(tRows)>0), mean(wordTbl.skipped(tRows)));
 
-%% ===== [P8] goPast (regression path duration) =====
+%% ===== [ADD] Regression Out (regOut) =====
+% 정의(권장, 단어-레벨):
+%   해당 단어(wi)에 "처음" 들어간 fixation 이후,
+%   다음으로 단어에 할당된 fixation(word>0)이
+%   더 왼쪽 단어(wordIdx < wi)로 가면 regOut=1,
+%   아니면 0.
+%   - 해당 단어를 skip(nFix==0)했으면 regOut=NaN
+%   - 해당 단어에 들어간 뒤, 다음 단어-할당 fixation이 없으면 regOut=NaN
+%
+% 주의:
+%   - trial 내 fixation 순서는 subj.trial(t).fixIdxDurClean 우선
+%   - fixation validity: subj.event.fix.isValid가 있으면 isValid==true만 사용
+
+assert(exist('subj','var')==1 && isstruct(subj), 'subj missing');
+assert(exist('wordTbl','var')==1 && istable(wordTbl), 'wordTbl missing');
+
+fx = subj.event.fix;
+assert(isfield(fx,'word'), 'fix.word missing (ROI mapping not done?)');
+
+fxWord = [fx.word]';
+fxOn   = [fx.onset]';
+
+% validity 마스크(있으면 적용)
+if isfield(fx,'isValid')
+    fxValid = logical([fx.isValid]');
+else
+    fxValid = true(numel(fx),1);
+end
+
+% 결과
+regOut = nan(height(wordTbl),1);
+
+% trial별로 한 번에 처리(속도+안정성)
+trU = unique(wordTbl.trial);
+for ti = 1:numel(trU)
+    tr = trU(ti);
+    if ~isfinite(tr) || tr<1 || tr>numel(subj.trial), continue; end
+
+    % trial fixation index: READ WINDOW 우선 (공식)
+    if isfield(subj.trial(tr),'readFixIdxClipped') && ~isempty(subj.trial(tr).readFixIdxClipped)
+        fIdx = subj.trial(tr).readFixIdxClipped(:);
+    elseif isfield(subj.trial(tr),'readFixIdx') && ~isempty(subj.trial(tr).readFixIdx)
+        fIdx = subj.trial(tr).readFixIdx(:);
+    elseif isfield(subj.trial(tr),'fixIdxDurClean') && ~isempty(subj.trial(tr).fixIdxDurClean)
+        fIdx = subj.trial(tr).fixIdxDurClean(:);
+    else
+        fIdx = subj.trial(tr).fixIdx(:);
+    end
+    fIdx = fIdx(fIdx>=1 & fIdx<=numel(fx));
+    if isempty(fIdx), continue; end
+
+    % validity 필터
+    fIdx = fIdx(fxValid(fIdx));
+
+    if isempty(fIdx), continue; end
+
+    % --- durClean과 교집합(권장: duration-clean을 항상 반영) ---
+    if isfield(subj.trial(tr),'fixIdxDurClean') && ~isempty(subj.trial(tr).fixIdxDurClean)
+        dc = subj.trial(tr).fixIdxDurClean(:);
+        dc = dc(dc>=1 & dc<=numel(fx));
+        fIdx = intersect(fIdx, dc, 'stable');
+    end
+    if isempty(fIdx), continue; end
+
+    % onset 기준으로 정렬(안전)
+    [~,ord] = sort(fxOn(fIdx), 'ascend');
+    fIdx = fIdx(ord);
+
+    wSeq = fxWord(fIdx);
+
+    keepW = (wSeq > 0);
+    wSeq  = wSeq(keepW);
+
+    if isempty(wSeq), continue; end
+
+    % 이 trial에 해당하는 wordTbl row들
+    rowsTr = find(wordTbl.trial == tr);
+
+    for rr = rowsTr(:)'
+        wi = wordTbl.wordIdx(rr);
+
+        % wi sanity
+        if ~isfinite(wi) || wi<=0
+            continue;
+        end
+
+        % read window 기준 skip 판정: wSeq에 wi가 없으면 skip
+        posWi = find(wSeq==wi, 1, 'first');
+        if isempty(posWi)
+            continue;   % regOut는 NaN 유지
+        end
+
+        if posWi == numel(wSeq)
+            regOut(rr) = NaN;          % wi 이후에 단어-할당 fixation이 없음
+        else
+            wNext = wSeq(posWi+1);     % 이미 word==0 제거했으므로 바로 다음이 “다음 단어”
+            regOut(rr) = double(wNext < wi);
+        end
+    end
+end
+
+% 테이블에 저장
+wordTbl.regOut = regOut;
+
+fprintf("[OK] regOut attached? %d | finite=%d/%d | mean=%.3f\n", ...
+    ismember("regOut", string(wordTbl.Properties.VariableNames)), ...
+    sum(isfinite(wordTbl.regOut)), height(wordTbl), mean(wordTbl.regOut,'omitnan'));
+
+% ---- quick check ----
+fprintf("[regOut] added. finite=%d/%d | mean=%.3f\n", ...
+    sum(isfinite(wordTbl.regOut)), height(wordTbl), mean(wordTbl.regOut,'omitnan'));
+
+% N+1 (spillover)에서 요약 확인
+if ismember("isSpillover", string(wordTbl.Properties.VariableNames))
+    wN1 = wordTbl(wordTbl.isSpillover,:);
+    fprintf("[regOut N+1] rows=%d | finite=%d | mean=%.3f\n", ...
+        height(wN1), sum(isfinite(wN1.regOut)), mean(wN1.regOut,'omitnan'));
+end
+
+%% ===== [P7.5] GD (gaze duration) - READ WINDOW RECOMPUTE (overwrite wordTbl.GD) =====
+% 목표: GD와 goPast를 동일한 fixation 집합(=read window clipped)에서 계산
+% GD 정의(여기서는 표준 first-pass):
+%   wi에 "처음" 진입한 fixation부터,
+%   처음으로 다른 단어(word>0 & ~=wi)로 이동하기 전까지의
+%   wi fixation duration 합.
+%
+% 사용 fixation 시퀀스(공식):
+%   readFixIdxClipped 우선 -> isValid 적용 -> durClean 교집합 -> 시간순 정렬
+%   그 후 word==0 제거 (단어 할당 fixation만)
+
+assert(exist('subj','var')==1 && isstruct(subj), 'subj missing');
+assert(exist('wordTbl','var')==1 && istable(wordTbl), 'wordTbl missing');
+assert(exist('isMain','var')==1 && numel(isMain)==numel(subj.trial), 'isMain missing/mismatch');
+
+fx = subj.event.fix;
+
+fxWord   = [fx.word]';
+fxOnset  = [fx.onset]';
+fxOffset = [fx.offset]';
+fxDur    = fxOffset - fxOnset;   % dur 필드가 있어도 여기로 통일(안전)
+
+% validity 마스크(있으면 적용)
+if isfield(fx,'isValid')
+    fxValid = logical([fx.isValid]');
+else
+    fxValid = true(numel(fx),1);
+end
+
+GD_rw = nan(height(wordTbl),1);   % recomputed GD (read window)
+
+trU = unique(wordTbl.trial);
+for ti = 1:numel(trU)
+    tr = trU(ti);
+    if ~isfinite(tr) || tr<1 || tr>numel(subj.trial), continue; end
+    if ~isMain(tr), continue; end
+
+    % ---- trial fixation index: READ WINDOW clipped 우선 ----
+    if isfield(subj.trial(tr),'readFixIdxClipped') && ~isempty(subj.trial(tr).readFixIdxClipped)
+        fIdx = subj.trial(tr).readFixIdxClipped(:);
+    elseif isfield(subj.trial(tr),'readFixIdx') && ~isempty(subj.trial(tr).readFixIdx)
+        fIdx = subj.trial(tr).readFixIdx(:);
+    elseif isfield(subj.trial(tr),'fixIdxDurClean') && ~isempty(subj.trial(tr).fixIdxDurClean)
+        fIdx = subj.trial(tr).fixIdxDurClean(:);
+    else
+        fIdx = subj.trial(tr).fixIdx(:);
+    end
+    fIdx = fIdx(fIdx>=1 & fIdx<=numel(fx));
+    if isempty(fIdx), continue; end
+
+    % ---- validity 필터 ----
+    fIdx = fIdx(fxValid(fIdx));
+    if isempty(fIdx), continue; end
+
+    % ---- durClean 교집합(공식) ----
+    if isfield(subj.trial(tr),'fixIdxDurClean') && ~isempty(subj.trial(tr).fixIdxDurClean)
+        dc = subj.trial(tr).fixIdxDurClean(:);
+        dc = dc(dc>=1 & dc<=numel(fx));
+        fIdx = intersect(fIdx, dc, 'stable');
+    end
+    if isempty(fIdx), continue; end
+
+    % ---- 시간순 정렬(안전) ----
+    [~,ord] = sort(fxOnset(fIdx), 'ascend');
+    fIdx = fIdx(ord);
+
+    wSeq   = fxWord(fIdx);
+    durSeq = fxDur(fIdx);
+
+    % ---- NEW: 단어에 할당된 fixation만 사용 (word==0 제거) ----
+    keepW  = (wSeq > 0);
+    wSeq   = wSeq(keepW);
+    durSeq = durSeq(keepW);
+
+    if isempty(wSeq), continue; end
+
+    rowsTr = find(wordTbl.trial == tr);
+
+    for rr = rowsTr(:)'
+        wi = wordTbl.wordIdx(rr);
+        if ~isfinite(wi) || wi<=0, continue; end
+
+        firstPos = find(wSeq==wi, 1, 'first');
+        if isempty(firstPos)
+            continue;  % read window 기준 skip
+        end
+
+        % first-pass 합산
+        s = 0;
+        for p = firstPos:numel(wSeq)
+            if wSeq(p)==wi, s = s + durSeq(p);
+            else, break;
+            end
+        end
+        GD_rw(rr) = s;
+    end
+end
+
+% ---- overwrite (P7.5 핵심) ----
+wordTbl.GD = GD_rw;
+
+% NEW: read-window 기준 skip (GD가 NaN이면 read window에서 못 본 단어)
+wordTbl.skipped_rw = ~isfinite(wordTbl.GD);
+
+fprintf("[P7.5 GD-rw] finite=%d/%d | median=%.0f\n", ...
+    sum(isfinite(wordTbl.GD)), height(wordTbl), median(wordTbl.GD,'omitnan'));
+
+fprintf("[P7.5 skipped_rw] mean=%.3f | nSkipped=%d/%d\n", ...
+    mean(wordTbl.skipped_rw), sum(wordTbl.skipped_rw), height(wordTbl));
+
+%% ===== [P8] goPast (regression path duration) - OFFICIAL RECOMPUTE =====
+% 정의: wi에 "처음" 진입한 fixation onset ~ (처음으로 오른쪽 단어(w>wi)로 간 fixation offset)까지
+% - regressions 포함
+% - 오른쪽으로 끝까지 못 가면 trial 마지막 fixation offset까지
+% - skip(nFix==0)면 NaN
+% - fixation 시퀀스는 "READ WINDOW clipped 우선" + isValid + durClean 교집합(공식)
+assert(exist('isMain','var')==1 && numel(isMain)==numel(subj.trial), 'isMain missing/mismatch');
+
 fx = subj.event.fix;
 fxWord   = [fx.word]';
 fxOnset  = [fx.onset]';
 fxOffset = [fx.offset]';
 
-wordTbl.goPast = nan(height(wordTbl),1);
-
-for i=1:height(wordTbl)
-    tr = wordTbl.trial(i);
-    wi = wordTbl.wordIdx(i);
-    if ~isfinite(tr) || tr<1 || tr>numel(subj.trial), continue; end
-    if ~isfinite(wi) || wi<=0, continue; end
-
-    fixIdx = subj.trial(tr).fixIdx(:);
-    fixIdx = fixIdx(fixIdx>0 & fixIdx<=numel(fxWord));
-    if isempty(fixIdx), continue; end
-
-    onThis = fixIdx(fxWord(fixIdx)==wi);
-    if isempty(onThis), continue; end
-
-    [~, loc] = ismember(onThis, fixIdx);
-    loc(loc==0) = [];
-    if isempty(loc), continue; end
-
-    firstPos = min(loc);
-    tStart   = fxOnset(fixIdx(firstPos));
-
-    exitPos = NaN;
-    for k = firstPos+1:numel(fixIdx)
-        if fxWord(fixIdx(k)) > wi
-            exitPos = k;
-            break;
-        end
-    end
-
-    if isnan(exitPos)
-        tEnd = fxOffset(fixIdx(end));
-    else
-        tEnd = fxOffset(fixIdx(exitPos));
-    end
-
-    gp = tEnd - tStart;
-    if isfinite(gp) && gp>8000, gp = NaN; end
-    wordTbl.goPast(i) = gp;
+% validity 마스크(있으면 적용)
+if isfield(fx,'isValid')
+    fxValid = logical([fx.isValid]');
+else
+    fxValid = true(numel(fx),1);
 end
 
-fprintf("[P8 goPast] finite=%d/%d | median=%.0f\n", ...
+wordTbl.goPast = nan(height(wordTbl),1);
+
+trU = unique(wordTbl.trial);
+for ti = 1:numel(trU)
+    tr = trU(ti);
+    if ~isfinite(tr) || tr<1 || tr>numel(subj.trial), continue; end
+    if ~isMain(tr), continue; end
+
+    % ---- trial fixation index: READ WINDOW clipped 우선 ----
+    if isfield(subj.trial(tr),'readFixIdxClipped') && ~isempty(subj.trial(tr).readFixIdxClipped)
+        fIdx = subj.trial(tr).readFixIdxClipped(:);
+    elseif isfield(subj.trial(tr),'readFixIdx') && ~isempty(subj.trial(tr).readFixIdx)
+        fIdx = subj.trial(tr).readFixIdx(:);
+    elseif isfield(subj.trial(tr),'fixIdxDurClean') && ~isempty(subj.trial(tr).fixIdxDurClean)
+        fIdx = subj.trial(tr).fixIdxDurClean(:);
+    else
+        fIdx = subj.trial(tr).fixIdx(:);
+    end
+    fIdx = fIdx(fIdx>=1 & fIdx<=numel(fx));
+    if isempty(fIdx), continue; end
+
+    % ---- validity 필터 ----
+    fIdx = fIdx(fxValid(fIdx));
+    if isempty(fIdx), continue; end
+
+    % ---- durClean 교집합(공식) ----
+    if isfield(subj.trial(tr),'fixIdxDurClean') && ~isempty(subj.trial(tr).fixIdxDurClean)
+        dc = subj.trial(tr).fixIdxDurClean(:);
+        dc = dc(dc>=1 & dc<=numel(fx));
+        fIdx = intersect(fIdx, dc, 'stable');
+    end
+    if isempty(fIdx), continue; end
+
+    % ---- 시간순 정렬(안전) ----
+    [~,ord] = sort(fxOnset(fIdx), 'ascend');
+    fIdx = fIdx(ord);
+
+    wSeq  = fxWord(fIdx);
+    onSeq = fxOnset(fIdx);
+    offSeq= fxOffset(fIdx);
+
+    % ---- NEW: 단어에 할당된 fixation만 사용 (word==0 제거) ----
+    keepW  = (wSeq > 0);
+    wSeq   = wSeq(keepW);
+    onSeq  = onSeq(keepW);
+    offSeq = offSeq(keepW);
+
+    if isempty(wSeq)
+        continue;   % 이 trial에서 단어 할당 fixation이 없음
+    end
+
+    % ---- 이 trial의 wordTbl row들 ----
+    rowsTr = find(wordTbl.trial == tr);
+
+    for rr = rowsTr(:)'
+        wi = wordTbl.wordIdx(rr);
+
+        wi = wordTbl.wordIdx(rr);
+        if ~isfinite(wi) || wi<=0
+            continue;
+        end
+
+        % read window 기준 skip: wSeq에 wi가 없으면 skip
+        firstPos = find(wSeq==wi, 1, 'first');
+        if isempty(firstPos)
+            continue;  % goPast는 NaN 유지
+        end        
+
+        tStart = onSeq(firstPos);
+
+        % 오른쪽 단어로 "처음" 간 시점 찾기 (w > wi)
+        exitRel = find(wSeq(firstPos+1:end) > wi, 1, 'first');
+        if isempty(exitRel)
+            tEnd = offSeq(end);
+        else
+            tEnd = offSeq(firstPos + exitRel);
+        end
+
+        gp = tEnd - tStart;
+
+        % QC와 일관된 trim
+        if isfinite(gp) && gp > 8000
+            gp = NaN;
+        end
+
+        wordTbl.goPast(rr) = gp;
+    end
+end
+
+fprintf("[P8 goPast RE] finite=%d/%d | median=%.0f\n", ...
     sum(isfinite(wordTbl.goPast)), height(wordTbl), median(wordTbl.goPast,'omitnan'));
+
+% ---- 핵심 sanity check ----
+ok = isfinite(wordTbl.goPast) & isfinite(wordTbl.GD);
+fprintf("[P8 sanity] prop(goPast>=GD)=%.3f | n=%d\n", mean(wordTbl.goPast(ok)>=wordTbl.GD(ok)), sum(ok));
+
+viol = ok & (wordTbl.goPast < wordTbl.GD - 1e-9);
+fprintf("[P8 sanity] violations(goPast<GD)=%d / %d (%.2f%%)\n", ...
+    sum(viol), sum(ok), 100*sum(viol)/max(sum(ok),1));
+
+if any(viol)
+    fprintf("[P8 sanity] showing 10 examples:\n");
+    show = find(viol, 10, 'first');
+    vars = intersect({'trial','wordIdx','nFix','FFD','GD','TVT','goPast','regOut','isTarget','isSpillover'}, ...
+        wordTbl.Properties.VariableNames,'stable');
+    disp(wordTbl(show, vars));
+end
+
+% ---- extra sanity checks (after GD & goPast recompute) ----
+% read window에서 wi를 봤는데 GD가 NaN이면 이상
+rwSeen = isfinite(wordTbl.GD) | isfinite(wordTbl.goPast);
+fprintf("seen_rw=%d | GD_NaN_when_seen=%d\n", sum(rwSeen), sum(rwSeen & ~isfinite(wordTbl.GD)));
+
+% goPast가 있는데 GD가 0에 가깝게 나오면(단위/dur 문제) 의심
+fprintf("median GD=%.1f | median goPast=%.1f\n", median(wordTbl.GD,'omitnan'), median(wordTbl.goPast,'omitnan'));
 
 %% ===== [P9] LANDING-ONLY FILTER SETS (create AFTER target & goPast) =====
 wL  = wordTbl(wordTbl.nFix>0 & isfinite(wordTbl.landingNorm), :);
@@ -766,22 +1131,66 @@ trials = trials(ismember(trials, mainSet));
 nT = numel(trials);
 
 trialSummary = table( ...
-    'Size',[nT 9], ...
-    'VariableTypes', {'string','double','double','double','double','double','double','double','logical'}, ...
-    'VariableNames', {'subj','trial','nWords','nSkipped','skipRate','readingTimeMs','meanFFD','meanGD','acc'});
+    'Size',[nT 12], ...
+    'VariableTypes', {'string','double','double','double','double','double','double','double','logical', ...
+                      'double','double','double'}, ...
+    'VariableNames', {'subj','trial','nWords','nSkipped','skipRate','readingTimeMs','meanFFD','meanGD','acc', ...
+                      'keepProp','outBoxProp','hit_read_clipped'});
 
 for ii = 1:nT
     t = trials(ii);
+
+    % ---- (B) clipped 기반 QC 지표 ----
+    r1 = [];
+    if isfield(subj.trial(t),'readFixIdx')
+        r1 = subj.trial(t).readFixIdx(:);
+    end
+    r2 = [];
+    if isfield(subj.trial(t),'readFixIdxClipped')
+        r2 = subj.trial(t).readFixIdxClipped(:);
+    end
+
+    r1 = r1(r1>=1 & r1<=numel(subj.event.fix));
+    r2 = r2(r2>=1 & r2<=numel(subj.event.fix));
+    
+    keepProp = numel(r2) / max(numel(r1),1);
+    outBoxProp = 1 - keepProp;
+
+    if isempty(r2)
+        hit_read_clipped = NaN;
+    else
+        w2 = [subj.event.fix(r2).word]';
+        hit_read_clipped = mean(w2>0);
+    end
+
+    trialSummary.keepProp(ii) = keepProp;
+    trialSummary.outBoxProp(ii) = outBoxProp;
+    trialSummary.hit_read_clipped(ii) = hit_read_clipped;
 
     % 이 trial의 word-level rows
     rows_t = wordTbl(wordTbl.trial == t, :);
 
     % 단어 수 / 스킵 수
     nWords   = height(rows_t);
-    nSkipped = sum(rows_t.skipped);
+    nSkipped = sum(rows_t.skipped_rw);
+    
+    % ===== (B-2) readingTimeMs: readFixIdxClipped 기반으로 통일 =====
+    r2 = [];
+    if isfield(subj.trial(t),'readFixIdxClipped') && ~isempty(subj.trial(t).readFixIdxClipped)
+        r2 = subj.trial(t).readFixIdxClipped(:);
+    elseif isfield(subj.trial(t),'readFixIdx') && ~isempty(subj.trial(t).readFixIdx)
+        % fallback (혹시 clipped가 비면)
+        r2 = subj.trial(t).readFixIdx(:);
+    end
+    r2 = r2(r2>=1 & r2<=numel(subj.event.fix));
 
-    % 문장 전체 TVT = 해당 trial의 모든 단어 TVT 합
-    tvtAll   = nansum(rows_t.TVT);
+    if isempty(r2)
+        readingTimeMs_rw = 0;
+    else
+        fx = subj.event.fix;
+        dur = ([fx(r2).offset] - [fx(r2).onset]);
+        readingTimeMs_rw = sum(dur, 'omitnan');
+    end
 
     % FFD / GD 평균 (단어들 중 NaN 아닌 것만)
     meanFFD = nanmean(rows_t.FFD);
@@ -811,8 +1220,8 @@ for ii = 1:nT
     trialSummary.trial(ii)         = t;
     trialSummary.nWords(ii)        = nWords;
     trialSummary.nSkipped(ii)      = nSkipped;
-    trialSummary.skipRate(ii)      = nSkipped / max(nWords,1);
-    trialSummary.readingTimeMs(ii) = tvtAll;       % TVT 기반 읽기시간
+    trialSummary.skipRate(ii) = nSkipped / max(nWords,1);
+    trialSummary.readingTimeMs(ii) = readingTimeMs_rw;   % ✅ read-window 기반 읽기시간
     trialSummary.meanFFD(ii)       = meanFFD;
     trialSummary.meanGD(ii)        = meanGD;
     trialSummary.acc(ii)           = acc;
@@ -856,7 +1265,7 @@ end
 
 % ---- 8.5 최종 저장 ----
 outFile = fullfile(baseDir, subjDir, 'eyeReading_cleanSummary.mat');
-save(outFile, 'cleanSummary', 'trialSummary', 'qcCfg');
+save(outFile, 'cleanSummary', 'trialSummary', 'qcCfg', 'clipCfg');
 
 fprintf('[SAVE] cleanSummary saved to %s (nTrials=%d, nClean=%d)\n', ...
     outFile, height(trialSummary), height(cleanSummary));
@@ -888,7 +1297,7 @@ else
     grid on;
 end
 
-outWordFile = fullfile(baseDir, subjDir, 'wordTbl_PILOT3.mat');
+outWordFile = fullfile(baseDir, subjDir, 'wordTbl_Sub01.mat');
 save(outWordFile, 'wordTbl');
 
 % === subj / design 정보도 따로 저장 (Stats용) ===
