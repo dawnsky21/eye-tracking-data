@@ -40,7 +40,10 @@ assert(exist("subj","var")==1 && isfield(subj,"trial") && isfield(subj,"event") 
 assert(exist("results","var")==1, "results 필요");
 
 %% 1) main trial 순번(1~224)으로 선택 → tSubj/tw 결정
-mainOrderWanted = 24;  % 1~224
+% (BATCH 호환) 밖에서 mainOrderWanted가 들어오면 그 값을 쓰고, 없으면 기본값
+if ~exist("mainOrderWanted","var") || ~isscalar(mainOrderWanted) || ~isfinite(mainOrderWanted)
+    mainOrderWanted = 24; % default
+end
 
 ids = string({subj.trial.id})';
 isMain = startsWith(ids,"TRIALID","IgnoreCase",true);
@@ -55,6 +58,55 @@ fprintf("[MAIN] order=%d | %s | tSubj=%d | tw=%d\n", ...
     mainOrderWanted, ids(tSubj), tSubj, tw);
 
 trialIDstr = ids(tSubj);   % 예: "TRIALID 179"
+
+%% === NEW: trialNum + valenceTag (for filename) ===
+% trial number: "TRIALID 41" -> 41
+trialNum = NaN;
+tok = regexp(trialIDstr, "TRIALID\s+(\d+)", "tokens", "once");
+if ~isempty(tok)
+    trialNum = str2double(tok{1});
+end
+
+% valenceTag: P/U/N (가능하면 designRow+Tmain에서, 없으면 wordTbl에서)
+valenceTag = "UNK";
+
+% (1) designRow + Tmain 우선
+if exist("designRow","var")==1 && exist("Tmain","var")==1 && numel(designRow)>=tw && isfinite(designRow(tw))
+    row = designRow(tw);
+    if istable(Tmain)
+        vcolCand = ["valence","emotion","emo","condition"];
+        vcol = "";
+        for c = vcolCand
+            if any(strcmpi(Tmain.Properties.VariableNames, c))
+                vcol = Tmain.Properties.VariableNames{strcmpi(Tmain.Properties.VariableNames, c)};
+                break;
+            end
+        end
+        if strlength(vcol)>0 && row>=1 && row<=height(Tmain)
+            v = upper(strtrim(string(Tmain.(vcol)(row))));
+            if any(v=="P" | v=="U" | v=="N")
+                valenceTag = v;
+            end
+        end
+    end
+end
+
+% (2) fallback: wordTbl.valence에서 trial==tw의 최빈값(있으면)
+if valenceTag=="UNK" && exist("wordTbl","var")==1 && istable(wordTbl) ...
+        && any(strcmpi(wordTbl.Properties.VariableNames,"valence")) ...
+        && any(strcmpi(wordTbl.Properties.VariableNames,"trial"))
+    vraw = upper(strtrim(string(wordTbl.valence(wordTbl.trial==tw))));
+    vraw = vraw(ismember(vraw, ["P","U","N"]));
+    if ~isempty(vraw)
+        % 최빈값
+        [uv,~,gi] = unique(vraw);
+        cnt = accumarray(gi,1);
+        [~,mx] = max(cnt);
+        valenceTag = uv(mx);
+    end
+end
+
+fprintf("[NAME] trialNum=%s | valenceTag=%s\n", string(trialNum), valenceTag);
 
 %% 1-1) ROI(rects) / words(wlist): results{tw}
 assert(isfield(results,'wordRects') && tw>=1 && tw<=numel(results.wordRects) && ~isempty(results.wordRects{tw}), ...
@@ -292,16 +344,47 @@ fprintf('[COORD] %s | dxMed=%.2f dyMed=%.2f (tw=%d)\n', coordMode, dxMed, dyMed,
 %% === target/spillover wordIdx (single source: targetIdxMain, main-only tw) ===
 targetWi = NaN; spillWi = NaN;
 
-if exist("targetIdxMain","var")==1 && numel(targetIdxMain) >= tw && isfinite(targetIdxMain(tw)) && targetIdxMain(tw) > 0
-    targetWi = targetIdxMain(tw);
-    spillWi  = targetWi + 1;
+targetWi = NaN; spillWi = NaN;
+
+if exist("targetIdxMain","var")==1 && numel(targetIdxMain) >= tw
+    ti = targetIdxMain(tw);
+
+    try
+        if ismissing(ti), ti = NaN; end
+    catch
+    end
+
+    if ~isnumeric(ti)
+        ti = str2double(string(ti));
+    end
+
+    if isfinite(ti) && ti > 0
+        targetWi = ti;
+        spillWi  = ti + 1;
+    end
 end
 
 % 범위 체크
 if ~(isfinite(targetWi) && targetWi>=1 && targetWi<=nWords), targetWi = NaN; end
 if ~(isfinite(spillWi)  && spillWi >=1 && spillWi <=nWords), spillWi  = NaN; end
 
-fprintf('[TARGET] wi=%s | [SPILLOVER] wi=%s\n', string(targetWi), string(spillWi));
+%% --- SAFE PRINT for target/spillover (NO local function; batch-safe) ---
+tWi = targetWi; 
+sWi = spillWi;
+
+try
+    if ismissing(tWi), tWi = NaN; end
+    if ismissing(sWi), sWi = NaN; end
+catch
+end
+
+if ~isnumeric(tWi), tWi = str2double(string(tWi)); end
+if ~isnumeric(sWi), sWi = str2double(string(sWi)); end
+
+if ~(isscalar(tWi) && isfinite(tWi)), tWi = NaN; end
+if ~(isscalar(sWi) && isfinite(sWi)), sWi = NaN; end
+
+fprintf('[TARGET] wi=%s | [SPILLOVER] wi=%s\n', string(tWi), string(sWi));
 
 %% 3) word1 inROI QC (가능할 때만)
 word1InROI = NaN; word1N = 0;

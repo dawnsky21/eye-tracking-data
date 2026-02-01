@@ -490,7 +490,7 @@ ids = regexprep(ids, "\s+", " ");
 ids = strtrim(ids);
 
 isMainTrial = startsWith(ids,"TRIALID","IgnoreCase",true);
-isMain = isMainTrial;   % ✅ alias (GD/goPast/trialSummary에서 사용)
+isMain = isMainTrial;   % alias (GD/goPast/trialSummary에서 사용)
 
 mainTrialIdx = find(isMainTrial);
 assert(~isempty(mainTrialIdx), "No MAIN trials found.");
@@ -1216,14 +1216,21 @@ mainSet = mainTrialIdx;
 trials = trials(ismember(trials, mainSet));
 nT = numel(trials);
 
-trialSummary = table( ...
-    'Size',[nT 13], ...
-    'VariableTypes', {'string','double','double','double','double','double','double','double','logical', ...
-                      'double','double','double','logical'}, ...
-    'VariableNames', {'subj','trial','nWords','nSkipped','skipRate','readingTimeMs','meanFFD','meanGD','acc', ...
-                      'keepProp','outBoxProp','hit_read_clipped','badTrial'});
+% ===== trialSummary schema (AUTO) =====
+vNames = {'subj','trial','nWords','nSkipped','skipRate','readingTimeMs','meanFFD','meanGD','acc', ...
+          'keepProp','outBoxProp','hit_read_clipped','badTrial'};
 
-trialSummary.badTrial(:) = false; 
+vTypes = {'string','double','double','double','double','double','double','double','logical', ...
+          'double','double','double','logical'};
+
+assert(numel(vNames)==numel(vTypes), "trialSummary schema mismatch: names=%d types=%d", ...
+    numel(vNames), numel(vTypes));
+
+trialSummary = table('Size',[nT numel(vNames)], ...
+    'VariableTypes', vTypes, ...
+    'VariableNames', vNames);
+
+trialSummary.badTrial(:) = false;
 
 if nT==0
     error("nT==0: no MAIN trials survived. Check wordTbl(main filter) / mainTrialIdx mapping / read window.");
@@ -1272,32 +1279,31 @@ for ii = 1:nT
     nWords   = height(rows_t);
     nSkipped = sum(rows_t.skipped_rw);
     
-    % ===== (B-2) readingTimeMs: readFixIdxClipped + isValid + durClean 기반 (복붙용) =====
-    r2 = [];
-    if isfield(subj.trial(t),'readFixIdxClipped') && ~isempty(subj.trial(t).readFixIdxClipped)
-        r2 = subj.trial(t).readFixIdxClipped(:);
-    elseif isfield(subj.trial(t),'readFixIdx') && ~isempty(subj.trial(t).readFixIdx)
-        r2 = subj.trial(t).readFixIdx(:);
+    % ===== (B-2) readingTimeMs: readFixIdxClipped + isValid + durClean (OFFICIAL) =====
+
+    % 0) clipped 강제(없으면 에러로 즉시 잡기)    
+    if ~isfield(subj.trial(t),'readFixIdxClipped') || isempty(subj.trial(t).readFixIdxClipped)
+        error("readFixIdxClipped missing/empty at t=%d. (A) READ WINDOW CLIP 블록이 먼저 실행되어야 함.", t);
     end
+    r2 = subj.trial(t).readFixIdxClipped(:);
 
-    % 안전 범위
-    r2 = r2(r2>=1 & r2<=numel(subj.event.fix));
-
+    % 1) 안전 범위
     fx = subj.event.fix;
+    r2 = r2(r2>=1 & r2<=numel(fx));
 
-    % isValid 적용
+    % 2) isValid 필터 (있으면 적용)
     if ~isempty(r2) && isfield(fx,'isValid')
-        r2 = r2(logical([fx(r2).isValid]'));
+        r2 = r2(logical([fx(r2).isValid]'));   % 순서 보존
     end
 
-    % durClean 교집합 적용(순서 보존)
+    % 3) durClean 교집합 (순서 보존)
     if ~isempty(r2) && isfield(subj.trial(t),'fixIdxDurClean') && ~isempty(subj.trial(t).fixIdxDurClean)
         dc = subj.trial(t).fixIdxDurClean(:);
         dc = dc(dc>=1 & dc<=numel(fx));
-        r2 = r2(ismember(r2, dc));
+        r2 = r2(ismember(r2, dc));            % r2 순서 유지
     end
 
-    % readingTimeMs 계산
+    % 4) readingTimeMs 계산 (duration은 offset-onset으로 통일)
     if isempty(r2)
         readingTimeMs_rw = NaN;
     else
@@ -1313,8 +1319,8 @@ for ii = 1:nT
     %   - Practice가 아닌 본 시행 기준: results.acc(i) 가 trial i 정오답 (논리)
     % subj trial -> results(main) index
 
-    tw = subj2res(t);  % results index (1..224)
-    assert(isfinite(tw), "Non-main trial entered: t=%d", t);
+    tw = subj2res(t);
+    if ~isfinite(tw), continue; end
 
     if isfield(results,'acc') && isfinite(tw) && tw>=1 && tw<=numel(results.acc)
         acc = logical(results.acc(tw));
@@ -1340,6 +1346,9 @@ for ii = 1:nT
     trialSummary.acc(ii)           = acc;
 end
 
+% ===== [ANCHOR] trialSummary.acc type fix (single anchor) =====
+trialSummary.acc = logical(trialSummary.acc);
+
 % ---- 8.2 trial-level 이상치 플래그 ----
 badTrial = false(height(trialSummary),1);
 badTrial = badTrial | trialSummary.skipRate > qcCfg.maxSkipRate;
@@ -1347,9 +1356,20 @@ badTrial = badTrial | ~isfinite(trialSummary.readingTimeMs);
 badTrial = badTrial | ~trialSummary.acc;
 trialSummary.badTrial = badTrial;
 
+% ===== [ANCHOR] CATCH mask (safe indexing) =====
+trIdx = trialSummary.trial;                 % double
+trIdx = round(trIdx);                       % 정수화(혹시 모를 소수 대비)
+okIdx = isfinite(trIdx) & trIdx>=1 & trIdx<=numel(targetIdxSubj);
+
+isCatch_all = false(height(trialSummary),1);
+isCatch_all(okIdx) = (targetIdxSubj(trIdx(okIdx)) == 0);
+
+% participant-level metrics should ignore catch
+mask = ~isCatch_all;
+overallAcc = mean(double(trialSummary.acc(~isCatch_all)));
+usableProp = mean(~trialSummary.badTrial(~isCatch_all));
+
 % ---- 8.3 participant-level 퀄리티 체크 ----
-overallAcc = mean(double(trialSummary.acc));
-usableProp = mean(~trialSummary.badTrial);
 badSubj = (overallAcc < qcCfg.minComprehension) || ...
           (usableProp < qcCfg.minUsableTrialProp);
 
@@ -1373,9 +1393,42 @@ else
     cleanSummary = trialSummary(~trialSummary.badTrial,:);
 end
 
+% ===== [ANCHOR] CATCH mask for cleanSummary (safe indexing) =====
+trIdx2 = cleanSummary.trial;
+trIdx2 = round(trIdx2);
+okIdx2 = isfinite(trIdx2) & trIdx2>=1 & trIdx2<=numel(targetIdxSubj);
+
+isCatchTrial = false(height(cleanSummary),1);
+isCatchTrial(okIdx2) = (targetIdxSubj(trIdx2(okIdx2)) == 0);
+
+% cleanSummary에서 제거
+cleanSummary = cleanSummary(~isCatchTrial, :);
+
+%% ===== [PATCH] QC-applied wordTbl 만들기 (badTrial 제거) =====
+if exist("wordTbl","var")==1 && istable(wordTbl)
+
+    if badSubj
+        wordTbl_clean = wordTbl([],:);   % 참가자 통째로 제외면 빈 테이블
+    else
+        goodTrials = cleanSummary.trial;                 % QC 통과 trial (subj trial index)
+        wordTbl_clean = wordTbl(ismember(wordTbl.trial, goodTrials), :);
+    end
+
+    fprintf("[QC wordTbl] totalRows=%d -> cleanRows=%d | badRowsLeft=%d\n", ...
+        height(wordTbl), height(wordTbl_clean), ...
+        sum(ismember(wordTbl_clean.trial, trialSummary.trial(trialSummary.badTrial))));
+else
+    warning("[QC wordTbl] wordTbl missing or not a table. skip.");
+end
+
 % ---- 8.5 최종 저장 ----
 outFile = fullfile(baseDir, subjDir, 'eyeReading_cleanSummary.mat');
-save(outFile, 'cleanSummary', 'trialSummary', 'qcCfg', 'clipCfg');
+
+if exist("wordTbl_clean","var")==1
+    save(outFile, 'cleanSummary', 'trialSummary', 'qcCfg', 'clipCfg', 'wordTbl_clean');
+else
+    save(outFile, 'cleanSummary', 'trialSummary', 'qcCfg', 'clipCfg');
+end
 
 fprintf('[SAVE] cleanSummary saved to %s (nTrials=%d, nClean=%d)\n', ...
     outFile, height(trialSummary), height(cleanSummary));
@@ -1408,9 +1461,169 @@ else
 end
 
 outWordFile = fullfile(baseDir, subjDir, 'wordTbl_Sub01.mat');
+if exist("wordTbl_clean","var")==1
+    wordTbl = wordTbl_clean; % 이후 분석/스크립트가 wordTbl만 봐도 안전하게
+end
 save(outWordFile, 'wordTbl');
 
 % === subj / design 정보도 따로 저장 (Stats용) ===
 subjFile = fullfile(baseDir, subjDir, 'subj.mat');
 save(subjFile, 'subj', 'designRow', 'Tmain');
 fprintf('[SAVE] subj saved to %s\n', subjFile);
+
+%% ========================================================================
+% BAD TRIALS: 전수 원인 + 단계별(READ→CLIP→VALID→DURCLEAN) 진단 + CSV/XLSX 저장
+% 붙이는 위치: subj.mat 저장 블록 바로 아래(권장)
+%% ========================================================================
+
+assert(exist("trialSummary","var")==1 && istable(trialSummary), "trialSummary missing");
+assert(exist("qcCfg","var")==1 && isstruct(qcCfg), "qcCfg missing");
+assert(exist("subj","var")==1 && isstruct(subj) && isfield(subj,"trial"), "subj.trial missing");
+assert(exist("baseDir","var")==1 && exist("subjDir","var")==1, "baseDir/subjDir missing");
+
+% ----- 1) bad trial만 추출 -----
+badTS = trialSummary(trialSummary.badTrial==true, :);
+fprintf("\n[BAD TRIALS] nBad=%d\n", height(badTS));
+
+if height(badTS)==0
+    warning("No bad trials. Skip badTrial export.");
+else
+    % ----- 2) bad 조건(현재 파이프라인 기준 3개) -----
+    isBad_skip = badTS.skipRate > qcCfg.maxSkipRate;
+    isBad_nan  = ~isfinite(badTS.readingTimeMs);
+    isBad_acc  = ~logical(badTS.acc);
+
+    reason = strings(height(badTS),1);
+    for i=1:height(badTS)
+        r = strings(0,1);
+        if isBad_skip(i), r(end+1)="SKIPRATE>0.70"; end %#ok<AGROW>
+        if isBad_nan(i),  r(end+1)="READINGTIME_NaN"; end %#ok<AGROW>
+        if isBad_acc(i),  r(end+1)="INCORRECT(ACC=0)"; end %#ok<AGROW>
+        if isempty(r), r = "UNKNOWN"; end
+        reason(i) = strjoin(r, " + ");
+    end
+
+    % ----- 3) 단계별 fixation 개수(READ→CLIP→VALID→DURCLEAN) -----
+    nRead    = nan(height(badTS),1);
+    nClip    = nan(height(badTS),1);
+    nValid   = nan(height(badTS),1);
+    nDurClean= nan(height(badTS),1);
+    stageFail = strings(height(badTS),1);
+
+    fx = subj.event.fix;
+    hasValid = isfield(fx,"isValid");
+    validMaskAll = true(numel(fx),1);
+    if hasValid
+        validMaskAll = logical([fx.isValid]');
+    end
+
+    for i=1:height(badTS)
+        tr = badTS.trial(i);
+        tr = round(tr);
+
+        if ~isfinite(tr) || tr<1 || tr>numel(subj.trial)
+            stageFail(i) = "TRIAL_INDEX_INVALID";
+            continue;
+        end
+
+        % readFixIdx
+        r1 = [];
+        if isfield(subj.trial(tr),"readFixIdx") && ~isempty(subj.trial(tr).readFixIdx)
+            r1 = subj.trial(tr).readFixIdx(:);
+        end
+        r1 = r1(r1>=1 & r1<=numel(fx));
+        nRead(i) = numel(r1);
+
+        % clipped (있으면 우선)
+        r2 = [];
+        if isfield(subj.trial(tr),"readFixIdxClipped") && ~isempty(subj.trial(tr).readFixIdxClipped)
+            r2 = subj.trial(tr).readFixIdxClipped(:);
+        else
+            r2 = r1;
+        end
+        r2 = r2(r2>=1 & r2<=numel(fx));
+        nClip(i) = numel(r2);
+
+        % isValid 필터
+        r3 = r2;
+        if ~isempty(r3) && hasValid
+            r3 = r3(validMaskAll(r3));
+        end
+        nValid(i) = numel(r3);
+
+        % durClean 교집합(순서 보존)
+        r4 = r3;
+        if ~isempty(r4) && isfield(subj.trial(tr),"fixIdxDurClean") && ~isempty(subj.trial(tr).fixIdxDurClean)
+            dc = subj.trial(tr).fixIdxDurClean(:);
+            dc = dc(dc>=1 & dc<=numel(fx));
+            r4 = r4(ismember(r4, dc));
+        end
+        nDurClean(i) = numel(r4);
+
+        % 어디서 0이 됐는지 라벨
+        if nRead(i)==0
+            stageFail(i) = "READ_FIXIDX_EMPTY";
+        elseif nClip(i)==0
+            stageFail(i) = "CLIPPED_EMPTY";
+        elseif nValid(i)==0
+            stageFail(i) = "ALL_INVALID_AFTER_isValid";
+        elseif nDurClean(i)==0
+            stageFail(i) = "ALL_REMOVED_AFTER_DURCLEAN";
+        else
+            stageFail(i) = "NO_STAGE_EMPTY";
+        end
+    end
+
+    % ----- 4) badDetail 테이블 구성 -----
+    keepCols = {'trial','nWords','nSkipped','skipRate','readingTimeMs','meanFFD','meanGD','acc', ...
+                'keepProp','outBoxProp','hit_read_clipped'};
+    keepCols = intersect(keepCols, badTS.Properties.VariableNames, 'stable');
+
+    badDetail = badTS(:, keepCols);
+    badDetail.reason    = reason;
+    badDetail.nRead     = nRead;
+    badDetail.nClip     = nClip;
+    badDetail.nValid    = nValid;
+    badDetail.nDurClean = nDurClean;
+    badDetail.stageFail = stageFail;
+
+    % ----- 5) 요약 카운트(원인/단계) -----
+    fprintf("\n[REASON COUNTS]\n");
+    Treason = table(categorical(badDetail.reason), 'VariableNames', {'reason'});
+    disp(groupcounts(Treason, 'reason'));
+
+    fprintf("\n[STAGEFAIL COUNTS]\n");
+    Tstage = table(categorical(badDetail.stageFail), 'VariableNames', {'stageFail'});
+    disp(groupcounts(Tstage, 'stageFail'));
+
+    % 보기 좋게 정렬: stageFail 심각도 우선, 다음 reason
+    sev = zeros(height(badDetail),1);
+    sev( badDetail.stageFail=="READ_FIXIDX_EMPTY")           = 5;
+    sev( badDetail.stageFail=="CLIPPED_EMPTY")              = 4;
+    sev( badDetail.stageFail=="ALL_INVALID_AFTER_isValid")   = 3;
+    sev( badDetail.stageFail=="ALL_REMOVED_AFTER_DURCLEAN")  = 2;
+    sev( badDetail.stageFail=="NO_STAGE_EMPTY")             = 1;
+    [~,ord] = sort(sev, 'descend');
+    badDetail = badDetail(ord,:);
+
+    fprintf("\n[BAD TRIALS DETAIL] (trial별)\n");
+    disp(badDetail);
+
+    % ----- 6) 저장: MAT + CSV + XLSX -----
+    badMat  = fullfile(baseDir, subjDir, "badTrial_detail.mat");
+    badCsv  = fullfile(baseDir, subjDir, "badTrial_detail.csv");
+    badXlsx = fullfile(baseDir, subjDir, "badTrial_detail.xlsx");
+
+    save(badMat, "badDetail");
+
+    writetable(badDetail, badCsv,  "Encoding","UTF-8");
+    writetable(badDetail, badXlsx, "FileType","spreadsheet");
+
+    fprintf("\n[SAVE] badDetail MAT : %s\n", badMat);
+    fprintf("[SAVE] badDetail CSV : %s\n", badCsv);
+    fprintf("[SAVE] badDetail XLSX: %s\n", badXlsx);
+
+    % (선택) 바로 열기
+    % winopen(badCsv);
+    % winopen(badXlsx);
+end
